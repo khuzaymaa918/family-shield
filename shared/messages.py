@@ -47,15 +47,13 @@ class Reached(Model):
     delivered: bool
 
 
-# Guardian -> Verifier: the student typed a code in ASI:One
-class CheckCode(Model):
-    case_id: str
-    student_name: str
-    code: str
-
-
-# Verifier -> Guardian
+# Verifier -> Guardian: what the student entered on the keypad during the call.
+# result is one of:
+#   "normal" -> right check code: the student is confirmed
+#   "danger" -> the danger code: silent alarm, the student may be under pressure
+#   "wrong"  -> neither code after a retry: stay NOT_CONFIRMED
+# The student hears the same reply for "normal" and "danger", so a bystander can't tell them apart.
 class CodeResult(Model):
     case_id: str
-    ok: bool
+    result: str
     time: str

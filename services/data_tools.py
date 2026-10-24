@@ -6,6 +6,7 @@ Replace the body of each function, keep the name, inputs and output type.
 Done by 4 PM.
 """
 import hashlib
+import hmac
 import os
 
 from dotenv import load_dotenv
@@ -24,8 +25,15 @@ def hash_code(code: str) -> str:
 
 
 # FAKE in-memory store until Moss is set up
+# Demo family: normal code 2580, danger code 7193 (same defaults as services/code_webhook.py's test mode).
+# Put a teammate's real US phone number here (E.164, like +14155550123) for the demo call.
 _FAKE_CONTACTS = {
-    "arjun": {"name": "Arjun", "phone": "+10000000000", "code_hash": hash_code("2580")},
+    "arjun": {
+        "name": "Arjun",
+        "phone": os.getenv("DEMO_STUDENT_PHONE") or "+10000000000",
+        "code_hash": hash_code("2580"),
+        "danger_hash": hash_code("7193"),
+    },
 }
 
 
@@ -65,6 +73,23 @@ def check_code(name: str, code: str) -> bool:
     # TODO (Teammate B): read the stored hash from Moss
     contact = _FAKE_CONTACTS.get(name.lower())
     return bool(contact) and contact["code_hash"] == hash_code(code)
+
+
+def classify_code(name: str, code: str) -> str:
+    """Returns "normal", "danger" or "wrong" for the digits a student entered.
+
+    Compares hashes in constant time so timing doesn't leak which code was close.
+    """
+    # TODO (Teammate B): read both stored hashes from Moss
+    contact = _FAKE_CONTACTS.get(name.lower())
+    if not contact:
+        return "wrong"
+    entered = hash_code(code)
+    if hmac.compare_digest(entered, contact["code_hash"]):
+        return "normal"
+    if contact.get("danger_hash") and hmac.compare_digest(entered, contact["danger_hash"]):
+        return "danger"
+    return "wrong"
 
 
 if __name__ == "__main__":

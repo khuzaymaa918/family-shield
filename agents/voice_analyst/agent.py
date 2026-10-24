@@ -4,6 +4,7 @@ On Analyze(note_id): download the note, transcribe it, extract the claims.
 
 Run from the repo root:  python -m agents.voice_analyst.agent
 """
+import asyncio
 import os
 
 from dotenv import load_dotenv
@@ -15,9 +16,13 @@ from shared.messages import Analyze, Claims
 
 load_dotenv()
 
+seed = os.getenv("VOICE_ANALYST_SEED")
+if not seed:
+    raise SystemExit("Set VOICE_ANALYST_SEED in your .env file first")
+
 agent = Agent(
     name="family_shield_voice_analyst",
-    seed=os.getenv("VOICE_ANALYST_SEED", "family-shield-voice-analyst-change-me"),
+    seed=seed,
     port=8001,
     mailbox=True,
 )
@@ -25,8 +30,9 @@ agent = Agent(
 
 @agent.on_message(model=Analyze, replies=Claims)
 async def analyze(ctx: Context, sender: str, msg: Analyze):
-    path = get_voice_note(msg.note_id)
-    transcript = transcribe(path)
+    # Both are blocking HTTP calls, so run them off the event loop.
+    path = await asyncio.to_thread(get_voice_note, msg.note_id)
+    transcript = await asyncio.to_thread(transcribe, path)
     # TODO (Lead): ask Claude to extract these fields as JSON from the transcript
     await ctx.send(
         sender,

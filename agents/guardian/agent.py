@@ -60,7 +60,8 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
             ctx.logger.info(f"Message from {sender}: {item.text}")
             # TODO (Lead): use Claude to turn item.text into a case
             # TODO (Lead): send Analyze -> Voice Analyst, GetFamily -> Family, ReachStudent -> Verifier
-            # TODO (Lead): if the sender is a student typing a code, send CheckCode -> Verifier
+            # TODO (Lead): handle CodeResult from the Verifier: "normal" -> CONFIRMED,
+            #   "danger" -> silent alarm to the parent, "wrong" -> stay NOT_CONFIRMED
             await ctx.send(
                 sender,
                 text_reply("Don't send any money yet. I'm checking with your child now."),

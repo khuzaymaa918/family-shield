@@ -15,9 +15,13 @@ from shared.messages import Contact, GetFamily
 
 load_dotenv()
 
+seed = os.getenv("FAMILY_SEED")
+if not seed:
+    raise SystemExit("Set FAMILY_SEED in your .env file first")
+
 agent = Agent(
     name="family_shield_family",
-    seed=os.getenv("FAMILY_SEED", "family-shield-family-change-me"),
+    seed=seed,
     port=8002,
     mailbox=True,
 )
