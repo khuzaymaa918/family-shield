@@ -1,0 +1,8 @@
+uagents
+uagents-core
+anthropic
+python-dotenv
+requests
+supabase
+# Teammate A: add the Cartesia SDK here once you've checked its docs
+# Teammate B: add the Moss SDK here once you've checked its docs
