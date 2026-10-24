@@ -9,12 +9,14 @@ import hashlib
 import os
 
 from dotenv import load_dotenv
+from supabase import Client, create_client
 
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 MOSS_API_KEY = os.getenv("MOSS_API_KEY")
 
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 def hash_code(code: str) -> str:
     """Store this, never the plain code."""
@@ -28,12 +30,21 @@ _FAKE_CONTACTS = {
 
 
 def get_voice_note(note_id: str) -> str:
-    """Download a voice note from Supabase storage (bucket 'voice-notes').
+    local_path = f"samples/{note_id}.mp3"
+    os.makedirs("samples", exist_ok=True)
 
-    Returns the local file path.
-    """
-    # TODO (Teammate B): download from Supabase storage
-    return f"samples/{note_id}.mp3"
+    if supabase:
+        try:
+            # Supabase 'voice-notes' 버킷에서 실제 음성 파일 다운로드
+            data = supabase.storage.from_("voice-notes").download(f"{note_id}.mp3")
+            with open(local_path, "wb") as f:
+                f.write(data)
+            return local_path
+        except Exception as e:
+            print(f"[Supabase Storage Note] {e}. Falling back to default path.")
+
+    return local_path
+
 
 
 def save_contact(name: str, phone: str, code: str) -> None:
