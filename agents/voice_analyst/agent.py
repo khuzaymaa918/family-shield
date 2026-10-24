@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from uagents import Agent, Context
 
 from services.cartesia_tools import transcribe
+from services.claude_tools import read_transcript
 from services.data_tools import get_voice_note
 from shared.messages import Analyze, Claims
 
@@ -33,14 +34,17 @@ async def analyze(ctx: Context, sender: str, msg: Analyze):
     # Both are blocking HTTP calls, so run them off the event loop.
     path = await asyncio.to_thread(get_voice_note, msg.note_id)
     transcript = await asyncio.to_thread(transcribe, path)
-    # TODO (Lead): ask Claude to extract these fields as JSON from the transcript
+    claims = await asyncio.to_thread(read_transcript, transcript)
+    story = claims["story"]
+    if claims["red_flags"]:
+        story += " (warning signs: " + "; ".join(claims["red_flags"]) + ")"
     await ctx.send(
         sender,
         Claims(
             case_id=msg.case_id,
-            claimed_identity="unknown",
-            amount="unknown",
-            story="unknown",
+            claimed_identity=claims["claimed_identity"],
+            amount=claims["amount"],
+            story=story,
             transcript=transcript,
         ),
     )
