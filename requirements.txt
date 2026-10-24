@@ -4,5 +4,7 @@ anthropic
 python-dotenv
 requests
 supabase
-# Teammate A: add the Cartesia SDK here once you've checked its docs
+# Teammate A: Cartesia is called over plain HTTPS with requests; the keypad code webhook needs these two
+fastapi
+uvicorn
 # Teammate B: add the Moss SDK here once you've checked its docs
