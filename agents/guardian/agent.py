@@ -287,6 +287,9 @@ def close(case_id: str, state: str, text: str = "", card: list | None = None):
     case["state"] = state
     if text:
         last_result[case["parent"]] = (text, card)
+        # Restart the cooldown from the result, not from when the case opened: the call takes over a minute,
+        # so a "thanks, I'll ignore the message from Arjun" right after the result must not place a new call.
+        last_case_at[case["parent"]] = time.time()
     if open_case.get(case["parent"]) == case_id:
         del open_case[case["parent"]]
 
