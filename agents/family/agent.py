@@ -5,12 +5,13 @@ The check code never leaves this agent or the Verifier.
 
 Run from the repo root:  python -m agents.family.agent
 """
+import asyncio
 import os
 
 from dotenv import load_dotenv
 from uagents import Agent, Context
 
-from services.data_tools import get_contact
+from services.data_tools import get_contact, warm_moss
 from shared.messages import Contact, GetFamily
 
 load_dotenv()
@@ -27,9 +28,14 @@ agent = Agent(
 )
 
 
+@agent.on_event("startup")
+async def load_directory(ctx: Context):
+    warm_moss()  # load the Moss family directory in the background
+
+
 @agent.on_message(model=GetFamily, replies=Contact)
 async def get_family(ctx: Context, sender: str, msg: GetFamily):
-    contact = get_contact(msg.student_name)
+    contact = await asyncio.to_thread(get_contact, msg.student_name)
     await ctx.send(
         sender,
         Contact(case_id=msg.case_id, student_name=msg.student_name, phone=contact.get("phone") or ""),
