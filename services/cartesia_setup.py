@@ -1,7 +1,8 @@
 """One-time Cartesia setup for deliver_voice_message. Owner: Teammate A (P2).
 
-Creates (or updates) the verify_code webhook tool and configures the call agent: it greets with our message,
-collects the check code from the keypad, sends it to services/code_webhook.py, and never reads it back.
+Creates (or updates) the verify_code and confirm_sent webhook tools and configures the call agent: it greets
+with our message, collects the check code from the keypad, then asks "did you send that message?" (1 yes, 2 no),
+sends both to services/code_webhook.py, and never reads the code back.
 Prints the two IDs to put in .env yourself. It never prints the API key or the webhook secret.
 
 Needs in .env: CARTESIA_API_KEY, CODE_WEBHOOK_URL (public https base, e.g. a cloudflared tunnel) and
@@ -22,6 +23,7 @@ import requests
 from services.cartesia_tools import CARTESIA_API, _headers
 
 TOOL_NAME = "verify_code"
+ANSWER_TOOL_NAME = "confirm_sent"
 
 INSTRUCTIONS = """You are Family Shield's Verifier, an AI assistant on a phone call for the student's family.
 Your welcome message already asked the student to enter their check code on the keypad.
@@ -35,10 +37,15 @@ Rules:
   with exactly those digits.
 - After you ask for the code again, wait for NEW digits. Send only digits entered after your latest request.
   Never send digits from earlier in the call again.
-- Never read back, repeat or confirm the digits. Never say whether a code was right or wrong. Never mention
-  that there is more than one code.
+- Never read back or repeat the digits.
 - If verify_code returns "retry", say only: "That didn't go through. Please enter your check code again."
-- When verify_code returns "recorded", say only: "Thanks, I'll let your family know." Then end the call.
+- If verify_code returns "ask", say only: "Thank you. Did you send your family a message asking for money?
+  Press 1 for yes, or 2 for no."
+- After that question, when the student presses 1 or 2 (or clearly says yes or no), call confirm_sent with
+  answer "1" for yes or "2" for no. If the answer is unclear, ask the question once more.
+- When verify_code or confirm_sent returns "recorded", say only: "Thanks, I'll let your family know."
+  Then end the call.
+- Never tell the student what to answer, and never suggest that one answer is better.
 - If they ask who you are, say you're an AI assistant calling for their family, then ask for the code again.
 - If they ask what the message said or whether their family is okay, say: "I don't have the details, but your
   family will talk to you soon." Then ask for the code again.
@@ -78,30 +85,41 @@ def claude_models() -> list[dict]:
     return sorted(claude, key=lambda m: m.get("average_latency_ms") or 10**9)
 
 
-def ensure_tool(webhook_url: str, secret: str) -> str:
-    """Creates the verify_code webhook tool, or points the existing one at the current URL."""
+TOOLS = {
+    TOOL_NAME: (
+        "Sends the check code the student entered. Use it every time they enter or say a code.",
+        {"code": {"type": "string", "description": "The digits the student entered, digits only."}},
+    ),
+    ANSWER_TOOL_NAME: (
+        "Sends the student's answer to 'Did you send your family a message asking for money?'. "
+        "Use it once, after verify_code returned ask.",
+        {"answer": {"type": "string", "description": "\"1\" if they said yes, \"2\" if they said no."}},
+    ),
+}
+
+
+def ensure_tool(webhook_url: str, secret: str, name: str = TOOL_NAME) -> str:
+    """Creates a webhook tool, or points the existing one at the current URL."""
+    description, fields = TOOLS[name]
     tool = {
         "type": "webhook",
-        "name": TOOL_NAME,
-        "description": "Sends the check code the student entered. Use it every time they enter or say a code.",
+        "name": name,
+        "description": description,
         "pre_tool_speech": "off",
         "execution_mode": "immediate",
         "response_timeout_secs": 10,
         "api_schema": {
-            "url": f"{webhook_url.rstrip('/')}/tools/verify_code",
+            "url": f"{webhook_url.rstrip('/')}/tools/{name}",
             "method": "POST",
             "request_body_schema": {
                 "type": "object",
-                "properties": {
-                    "case_id": {"type": "string", "dynamic_variable": "case_id"},
-                    "code": {"type": "string", "description": "The digits the student entered, digits only."},
-                },
-                "required": ["code"],
+                "properties": {"case_id": {"type": "string", "dynamic_variable": "case_id"}, **fields},
+                "required": list(fields),
             },
             "authentication": {"mode": "bearer", "token": {"type": "secret", "secret_value": secret}},
         },
     }
-    existing = next((t for t in _items(_get("/v1/agents/tools", limit=100)) if t.get("name") == TOOL_NAME), None)
+    existing = next((t for t in _items(_get("/v1/agents/tools", limit=100)) if t.get("name") == name), None)
     if existing:
         response = requests.patch(
             f"{CARTESIA_API}/v1/agents/tools/{existing['id']}",
@@ -113,17 +131,17 @@ def ensure_tool(webhook_url: str, secret: str) -> str:
         response = requests.post(f"{CARTESIA_API}/v1/agents/tools", headers=_headers(), json=tool, timeout=30)
     if not response.ok:
         # The request carried the webhook secret; never echo it back if Cartesia's error repeats the input.
-        sys.exit(f"Saving the {TOOL_NAME} tool failed ({response.status_code}): {response.text.replace(secret, '***')[:500]}")
+        sys.exit(f"Saving the {name} tool failed ({response.status_code}): {response.text.replace(secret, '***')[:500]}")
     return existing["id"] if existing else response.json()["id"]
 
 
-def configure(agent_id: str, model_id: str, tool_id: str) -> None:
+def configure(agent_id: str, model_id: str, tool_ids: list[str]) -> None:
     config = {
         "initial_message": "{{message}}",
         "instructions": INSTRUCTIONS,
         "language": {"primary": "en"},
         "model": {"id": model_id},
-        "tools": [{"id": tool_id}],
+        "tools": [{"id": t} for t in tool_ids],
         # {} turns a system tool on with Cartesia's defaults.
         "system_tools": {"end_call": {}, "voicemail_detection": {}},
         "turn": {"inactivity_end_call_secs": SILENT_HANGUP_SECS, "inactivity_check_in_secs": CHECK_IN_SECS},
@@ -178,10 +196,10 @@ def main() -> None:
     webhook_url, secret = os.getenv("CODE_WEBHOOK_URL"), os.getenv("CODE_WEBHOOK_SECRET")
     if not (webhook_url and webhook_url.startswith("https://") and secret):
         sys.exit("Set CODE_WEBHOOK_URL (public https://...) and CODE_WEBHOOK_SECRET in .env first")
-    tool_id = ensure_tool(webhook_url, secret)
-    configure(agent["id"], model_id, tool_id)
+    tool_ids = [ensure_tool(webhook_url, secret, name) for name in TOOLS]
+    configure(agent["id"], model_id, tool_ids)
     print(
-        f"\nConfigured {args.agent!r}: model {model_id}, tool {TOOL_NAME} -> {webhook_url.rstrip('/')}/tools/verify_code, "
+        f"\nConfigured {args.agent!r}: model {model_id}, tools {', '.join(TOOLS)} -> {webhook_url.rstrip('/')}/tools/..., "
         f"check-in after {CHECK_IN_SECS}s, hangs up after {SILENT_HANGUP_SECS}s of silence"
     )
 

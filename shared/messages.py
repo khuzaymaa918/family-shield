@@ -1,7 +1,7 @@
 """Messages the Family Shield agents send each other.
 
 Everyone builds against this file. Tell the team before changing it.
-The check code itself never reaches the Guardian: only ok=True/False.
+The check code itself never reaches the Guardian: only the outcome of the call.
 """
 from uagents import Model
 
@@ -47,12 +47,11 @@ class Reached(Model):
     delivered: bool
 
 
-# Verifier -> Guardian: what the student entered on the keypad during the call.
-# result is one of:
-#   "normal" -> right check code: the student is confirmed
-#   "danger" -> the danger code: silent alarm, the student may be under pressure
-#   "wrong"  -> neither code after a retry: stay NOT_CONFIRMED
-# The student hears the same reply for "normal" and "danger", so a bystander can't tell them apart.
+# Verifier -> Guardian: the outcome of the verification call. result is one of:
+#   "sent"      -> right check code, and the student confirmed they DID send the message
+#   "not_sent"  -> right check code, and the student said they did NOT send it: a scam
+#   "wrong"     -> wrong check code twice: not confirmed
+#   "no_answer" -> right code, but no clear 1/2 answer: not confirmed
 class CodeResult(Model):
     case_id: str
     result: str

@@ -9,6 +9,7 @@ import concurrent.futures
 import hashlib
 import hmac
 import os
+import re
 import sys
 import threading
 import time
@@ -30,36 +31,65 @@ def hash_code(code: str) -> str:
 
 
 # Demo family, used to seed Moss and as a fallback when Moss isn't set up.
-# Demo family: normal code 2580, danger code 7193 (same defaults as services/code_webhook.py's test mode).
+# Demo family: check code 2580 (same default as services/code_webhook.py's test mode).
 # Put a teammate's real US phone number here (E.164, like +14155550123) for the demo call.
 _FAKE_CONTACTS = {
     "arjun": {
         "name": "Arjun",
         "phone": os.getenv("DEMO_STUDENT_PHONE") or "+10000000000",
         "code_hash": hash_code("2580"),
-        "danger_hash": hash_code("7193"),
         "relation": "son, college student",
         "aliases": ["AJ", "my son"],
     },
 }
 
 
-def get_voice_note(note_id: str) -> str:
-    local_path = f"samples/{note_id}.mp3"
-    os.makedirs("samples", exist_ok=True)
+VOICE_BUCKET = "voice-notes"
 
+
+def _note_number(filename: str) -> int:
+    m = re.search(r"-(\d+)\.mp3$", filename)
+    return int(m.group(1)) if m else 0
+
+
+def get_voice_note(note_id: str) -> str:
+    """Download a voice note from Supabase storage (bucket 'voice-notes') and return the local path.
+
+    note_id can be an exact file id ("arjun-2", "note-1") or just the child's name ("arjun"):
+    then the newest note named after them is used (arjun.mp3, arjun-1.mp3, arjun-2.mp3 ... highest wins).
+    Returns "" if no note is found.
+    """
+    key = note_id.strip().lower().removesuffix(".mp3")
+    if not key:
+        return ""
+    os.makedirs("samples", exist_ok=True)
+    exact = bool(re.search(r"-\d+$", key))
+
+    filename = f"{key}.mp3"
+    if supabase and not exact:
+        try:
+            files = supabase.storage.from_(VOICE_BUCKET).list("", {"limit": 1000, "search": key})
+            names = [f["name"] for f in files if f.get("name", "").lower() == f"{key}.mp3"
+                     or re.fullmatch(rf"{re.escape(key)}-\d+\.mp3", f.get("name", "").lower())]
+            if names:
+                filename = max(names, key=_note_number)
+        except Exception as e:
+            print(f"[Supabase Storage Note] listing failed: {e}")
+
+    local_path = f"samples/{filename}"
     if supabase:
         try:
-            # Supabase 'voice-notes' 버킷에서 실제 음성 파일 다운로드
-            data = supabase.storage.from_("voice-notes").download(f"{note_id}.mp3")
+            data = supabase.storage.from_(VOICE_BUCKET).download(filename)
             with open(local_path, "wb") as f:
                 f.write(data)
             return local_path
         except Exception as e:
-            print(f"[Supabase Storage Note] {e}. Falling back to default path.")
+            print(f"[Supabase Storage Note] {filename}: {e}. Trying a local copy.")
 
-    return local_path
-
+    if os.path.exists(local_path):
+        return local_path
+    local = [n for n in os.listdir("samples") if re.fullmatch(rf"{re.escape(key)}(-\d+)?\.mp3", n.lower())]
+    return f"samples/{max(local, key=_note_number)}" if local else ""
 
 
 # ---------- Family directory in Moss ----------
@@ -126,7 +156,6 @@ def _doc_for(contact: dict):
             "aliases": ",".join(aliases),
             "phone": contact["phone"],
             "code_hash": contact["code_hash"],
-            "danger_hash": contact.get("danger_hash", ""),
         },
     )
 
@@ -179,11 +208,10 @@ def _find(name: str) -> dict:
     return found
 
 
-def save_contact(name: str, phone: str, code: str, danger_code: str = "",
+def save_contact(name: str, phone: str, code: str,
                  relation: str = "family member", aliases: list[str] | None = None) -> None:
     """Save a family member's phone and HASHED codes (Moss if set up, plus the local list)."""
     contact = {"name": name, "phone": phone, "code_hash": hash_code(code),
-               "danger_hash": hash_code(danger_code) if danger_code else "",
                "relation": relation, "aliases": aliases or []}
     _FAKE_CONTACTS[name.lower()] = contact
     client = _moss_client()
@@ -204,18 +232,15 @@ def check_code(name: str, code: str) -> bool:
 
 
 def classify_code(name: str, code: str) -> str:
-    """Returns "normal", "danger" or "wrong" for the digits a student entered.
+    """Returns "normal" (right check code) or "wrong" for the digits a student entered.
 
-    Compares hashes in constant time so timing doesn't leak which code was close.
+    Compares hashes in constant time so timing doesn't leak how close a code was.
     """
     contact = _find(name)
     if not contact:
         return "wrong"
-    entered = hash_code(code)
-    if hmac.compare_digest(entered, contact["code_hash"]):
+    if hmac.compare_digest(hash_code(code), contact["code_hash"]):
         return "normal"
-    if contact.get("danger_hash") and hmac.compare_digest(entered, contact["danger_hash"]):
-        return "danger"
     return "wrong"
 
 
@@ -227,6 +252,5 @@ if __name__ == "__main__":
         _load_moss_index()
     print("source:", "Moss" if _moss_loaded.is_set() else "local demo list")
     print(get_contact("Arjun"), get_contact("AJ"), get_contact("Priya"))
-    print("normal:", classify_code("Arjun", "2580"), "| danger:", classify_code("Arjun", "7193"),
-          "| wrong:", classify_code("Arjun", "1111"))
-    print(get_voice_note("note-1"))
+    print("right code:", classify_code("Arjun", "2580"), "| wrong code:", classify_code("Arjun", "1111"))
+    print("voice note for Arjun:", get_voice_note("arjun") or "(none found)")

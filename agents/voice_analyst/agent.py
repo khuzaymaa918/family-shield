@@ -1,6 +1,7 @@
 """Voice Analyst agent. Owner: Lead (P1). Uses Teammate A and B's functions.
 
-On Analyze(note_id): download the note, transcribe it, extract the claims.
+On Analyze(note_id): download the note (an exact id, or the newest note named after the child),
+transcribe it, extract the claims.
 
 Run from the repo root:  python -m agents.voice_analyst.agent
 """
@@ -33,6 +34,9 @@ agent = Agent(
 async def analyze(ctx: Context, sender: str, msg: Analyze):
     # Both are blocking HTTP calls, so run them off the event loop.
     path = await asyncio.to_thread(get_voice_note, msg.note_id)
+    if not path:
+        ctx.logger.info(f"Case {msg.case_id}: no voice note found for '{msg.note_id}', skipping analysis")
+        return
     transcript = await asyncio.to_thread(transcribe, path)
     claims = await asyncio.to_thread(read_transcript, transcript)
     story = claims["story"]

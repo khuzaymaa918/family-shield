@@ -1,25 +1,29 @@
-"""Receives the check code a student types on the keypad during the Family Shield call. Owner: Teammate A (P2).
+"""Receives what the student enters on the keypad during the Family Shield call. Owner: Teammate A (P2).
 
-The Cartesia call agent sends the digits here through its verify_code webhook tool. This module only
-receives them; whoever starts it decides what a code means (check_code, CodeResult to the Guardian).
+The Cartesia call agent sends two things here through its webhook tools:
+  1. verify_code: the 4-digit check code
+  2. confirm_sent: the answer to "Did you send your family a message asking for money?" (1 yes, 2 no)
+This module only receives them; whoever starts it decides what they mean (the Verifier agent).
 
 Inside the Verifier agent:
 
-    from services.code_webhook import RECORDED, RETRY, start_in_background
+    from services.code_webhook import ASK, RECORDED, RETRY, start_in_background
 
     async def on_code(case_id: str, digits: str) -> str:
-        # Three outcomes. Normal and danger codes MUST get the same reply, or a bystander can tell them apart.
-        #   normal code -> tell the Guardian "confirmed",      return RECORDED
-        #   danger code -> tell the Guardian "danger signal",  return RECORDED
-        #   neither     -> return RETRY once, then RECORDED and leave the case unconfirmed
-        # Return fast: the call agent waits on this reply. Do slow work (ctx.send to the Guardian) in
-        # asyncio.create_task(...). If this raises or takes longer than HANDLER_TIMEOUT_SECS, the student
-        # still hears the normal reply and the error is logged.
+        #   right code -> return ASK (the call then asks "did you send that message?")
+        #   wrong code -> return RETRY once, then RECORDED (call ends, case not confirmed)
         ...
+
+    async def on_answer(case_id: str, answer: str) -> str:   # answer is "yes", "no" or ""
+        ...                                                  # tell the Guardian, return RECORDED
 
     @agent.on_event("startup")
     async def start_code_webhook(ctx):
-        start_in_background(on_code)
+        start_in_background(on_code, on_answer)
+
+Return fast: the call agent waits on each reply. Do slow work (ctx.send to the Guardian) in
+asyncio.create_task(...). If a handler raises or takes longer than HANDLER_TIMEOUT_SECS, the student
+hears the safe reply (RECORDED) and the error is logged.
 
 Standalone test (no agents): python -m services.code_webhook
 """
@@ -44,12 +48,14 @@ CODE_WEBHOOK_PORT = int(os.getenv("CODE_WEBHOOK_PORT") or "8090")
 # "retry" means ask once more. It never learns whether the code was right.
 RECORDED = "recorded"
 RETRY = "retry"
+ASK = "ask"  # right code: now ask "did you send that message?"
 # Cartesia's tool timeout is 10s (cartesia_setup.py). Answer well before it so the agent never improvises.
 HANDLER_TIMEOUT_SECS = 5
 
 log = logging.getLogger(__name__)
 
 CodeHandler = Callable[[str, str], str | Awaitable[str]]
+AnswerHandler = Callable[[str, str], str | Awaitable[str]]
 
 
 class CodeIn(BaseModel):
@@ -59,38 +65,72 @@ class CodeIn(BaseModel):
     code: str
 
 
+class AnswerIn(BaseModel):
+    model_config = ConfigDict(coerce_numbers_to_str=True)
+    case_id: str | None = ""
+    answer: str
+
+
+def _yes_no(text: str) -> str:
+    """'1'/'yes' -> 'yes', '2'/'no' -> 'no', anything else -> ''."""
+    t = text.strip().lower()
+    digits = _digits(t)
+    if digits[:1] == "1" or t.startswith("y") or t == "one":
+        return "yes"
+    if digits[:1] == "2" or t.startswith("n") or t == "two":
+        return "no"
+    return ""
+
+
 def _digits(text: str) -> str:
     # Keypad gives 0-9; speech-to-text may give other scripts (e.g. Devanagari), so map every digit to 0-9.
     return "".join(str(unicodedata.digit(ch)) for ch in text if unicodedata.digit(ch, None) is not None)
 
 
-def make_app(on_code: CodeHandler) -> FastAPI:
+def _check_auth(authorization: str | None) -> None:
+    expected = f"Bearer {CODE_WEBHOOK_SECRET}"
+    if not CODE_WEBHOOK_SECRET or not hmac.compare_digest((authorization or "").encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+async def _call(handler, case_id: str, value: str, what: str) -> str:
+    try:
+        reply = handler(case_id, value)
+        if inspect.isawaitable(reply):
+            reply = await asyncio.wait_for(reply, HANDLER_TIMEOUT_SECS)
+        return reply
+    except Exception as error:
+        # Never let a handler failure change what the student hears. Log the type only, never the digits.
+        log.error("%s handler failed for case %s: %s", what, case_id or "-", type(error).__name__)
+        return RECORDED
+
+
+def make_app(on_code: CodeHandler, on_answer: AnswerHandler | None = None) -> FastAPI:
     app = FastAPI(title="Family Shield code webhook")
 
     @app.post("/tools/verify_code")
     async def verify_code(body: CodeIn, authorization: str | None = Header(default=None)) -> dict:
-        expected = f"Bearer {CODE_WEBHOOK_SECRET}"
-        if not CODE_WEBHOOK_SECRET or not hmac.compare_digest((authorization or "").encode(), expected.encode()):
-            raise HTTPException(status_code=401, detail="unauthorized")
-        try:
-            reply = on_code(body.case_id or "", _digits(body.code))
-            if inspect.isawaitable(reply):
-                reply = await asyncio.wait_for(reply, HANDLER_TIMEOUT_SECS)
-        except Exception as error:
-            # Never let a handler failure change what the student hears. Log the type only, never the digits.
-            log.error("code handler failed for case %s: %s", body.case_id or "-", type(error).__name__)
-            reply = RECORDED
-        return {"result": reply if reply in (RECORDED, RETRY) else RECORDED}
+        _check_auth(authorization)
+        reply = await _call(on_code, body.case_id or "", _digits(body.code), "code")
+        return {"result": reply if reply in (RECORDED, RETRY, ASK) else RECORDED}
+
+    @app.post("/tools/confirm_sent")
+    async def confirm_sent(body: AnswerIn, authorization: str | None = Header(default=None)) -> dict:
+        _check_auth(authorization)
+        if on_answer is None:
+            return {"result": RECORDED}
+        await _call(on_answer, body.case_id or "", _yes_no(body.answer), "answer")
+        return {"result": RECORDED}
 
     return app
 
 
-async def serve(on_code: CodeHandler, port: int = CODE_WEBHOOK_PORT) -> None:
+async def serve(on_code: CodeHandler, port: int = CODE_WEBHOOK_PORT, on_answer: AnswerHandler | None = None) -> None:
     """Runs the webhook server in the current event loop until cancelled."""
     if not CODE_WEBHOOK_SECRET:
         raise RuntimeError("Set CODE_WEBHOOK_SECRET in .env")
     # Loopback only: cloudflared forwards from localhost, so nothing on the venue Wi-Fi can reach it directly.
-    config = uvicorn.Config(make_app(on_code), host="127.0.0.1", port=port, log_level="warning")
+    config = uvicorn.Config(make_app(on_code, on_answer), host="127.0.0.1", port=port, log_level="warning")
     try:
         await uvicorn.Server(config).serve()
     except SystemExit as error:
@@ -101,11 +141,12 @@ async def serve(on_code: CodeHandler, port: int = CODE_WEBHOOK_PORT) -> None:
 _tasks: set[asyncio.Task] = set()
 
 
-def start_in_background(on_code: CodeHandler, port: int = CODE_WEBHOOK_PORT) -> asyncio.Task:
+def start_in_background(on_code: CodeHandler, on_answer: AnswerHandler | None = None,
+                        port: int = CODE_WEBHOOK_PORT) -> asyncio.Task:
     """Starts serve() as a task in the running loop. Fails now if the secret is missing; logs later failures."""
     if not CODE_WEBHOOK_SECRET:
         raise RuntimeError("Set CODE_WEBHOOK_SECRET in .env")
-    task = asyncio.get_running_loop().create_task(serve(on_code, port))
+    task = asyncio.get_running_loop().create_task(serve(on_code, port, on_answer))
     _tasks.add(task)
 
     def _report(done: asyncio.Task) -> None:
@@ -118,24 +159,24 @@ def start_in_background(on_code: CodeHandler, port: int = CODE_WEBHOOK_PORT) -> 
 
 
 if __name__ == "__main__":
-    # Test handler: classifies against TEST_CHECK_CODE (default 2580) and TEST_DANGER_CODE (default 7193)
-    # and prints only the outcome, never the digits themselves.
+    # Test handlers: right code = TEST_CHECK_CODE (default 2580). Prints only outcomes, never the digits.
     normal_code = os.getenv("TEST_CHECK_CODE") or "2580"
-    danger_code = os.getenv("TEST_DANGER_CODE") or "7193"
     misses: dict[str, int] = {}
 
-    def test_handler(case_id: str, digits: str) -> str:
+    def test_code(case_id: str, digits: str) -> str:
         if hmac.compare_digest(digits, normal_code):
-            outcome, reply = "normal code -> confirmed", RECORDED
-        elif hmac.compare_digest(digits, danger_code):
-            outcome, reply = "DANGER code -> silent alarm", RECORDED
+            outcome, reply = "right code -> asking 'did you send it?'", ASK
         elif misses.get(case_id, 0) == 0:
             misses[case_id] = 1
-            outcome, reply = "neither -> asking once more", RETRY
+            outcome, reply = "wrong -> asking once more", RETRY
         else:
-            outcome, reply = "neither again -> not confirmed", RECORDED
+            outcome, reply = "wrong again -> not confirmed", RECORDED
         print(f"case {case_id or '-'}: {len(digits)} digits, {outcome}, replied {reply!r}", flush=True)
         return reply
 
-    print(f"Code webhook on http://localhost:{CODE_WEBHOOK_PORT}/tools/verify_code (Ctrl+C to stop)", flush=True)
-    asyncio.run(serve(test_handler))
+    def test_answer(case_id: str, answer: str) -> str:
+        print(f"case {case_id or '-'}: sent the message? {answer or 'unclear'}", flush=True)
+        return RECORDED
+
+    print(f"Code webhook on http://localhost:{CODE_WEBHOOK_PORT}/tools/... (Ctrl+C to stop)", flush=True)
+    asyncio.run(serve(test_code, on_answer=test_answer))
