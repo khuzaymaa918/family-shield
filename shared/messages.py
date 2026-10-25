@@ -56,3 +56,18 @@ class CodeResult(Model):
     case_id: str
     result: str
     time: str
+
+
+# Guardian -> Scam Intel: check this story against real scam reports
+class CheckScam(Model):
+    case_id: str
+    text: str
+
+
+# Scam Intel -> Guardian: information for the parent only, it never decides green/red.
+# summary is "" when nothing matched.
+class ScamReport(Model):
+    case_id: str
+    summary: str
+    matches: int
+    sources: str

@@ -1,7 +1,7 @@
 """Guardian agent. Owner: Lead (P1).
 
 Talks to the parent in ASI:One (Chat Protocol) and coordinates the other agents:
-  parent message -> Claude reads it -> Analyze (Voice Analyst) + GetFamily (Family)
+  parent message -> Claude reads it -> Analyze (Voice Analyst) + GetFamily (Family) + CheckScam (Scam Intel)
   Contact -> ReachStudent (Verifier) -> the student gets a call, types their check code,
              then answers "Did you send that message?" (1 yes / 2 no)
   CodeResult -> one reply to the parent:
@@ -14,7 +14,7 @@ Nothing else (Claude, the transcript, how real the voice sounds, the parent, a t
 We never tell the parent to send money, only whether the request really came from their child.
 
 Needs in .env: GUARDIAN_SEED, VOICE_ANALYST_ADDRESS, FAMILY_ADDRESS, VERIFIER_ADDRESS
-(each agent prints its address when it starts). ANTHROPIC_API_KEY is optional.
+(each agent prints its address when it starts). Optional: SCAM_INTEL_ADDRESS, ANTHROPIC_API_KEY.
 
 Run from the repo root:  python -m agents.guardian.agent
 """
@@ -40,7 +40,9 @@ from uagents_core.contrib.protocols.chat import (
 
 from services.claude_tools import read_parent_message
 from shared.cards import progress_card, result_card
-from shared.messages import Analyze, Claims, CodeResult, Contact, GetFamily, Reached, ReachStudent
+from shared.messages import (
+    Analyze, CheckScam, Claims, CodeResult, Contact, GetFamily, Reached, ReachStudent, ScamReport,
+)
 
 load_dotenv()
 
@@ -51,6 +53,7 @@ if not seed:
 VOICE_ANALYST = os.getenv("VOICE_ANALYST_ADDRESS", "")
 FAMILY = os.getenv("FAMILY_ADDRESS", "")
 VERIFIER = os.getenv("VERIFIER_ADDRESS", "")
+SCAM_INTEL = os.getenv("SCAM_INTEL_ADDRESS", "")  # optional: pattern check against real scam reports
 # How long to wait for the student's code before telling the parent "not confirmed".
 CODE_TIMEOUT_SECONDS = int(os.getenv("CODE_TIMEOUT_SECONDS", "180"))
 
@@ -105,7 +108,7 @@ AI_CHATTER = re.compile(
     r"\b(i'?m|i am) (\w+, )?(an? )?(ai|assistant|shopping assistant|language model)\b|\bas an ai\b|"
     r"\ban ai assistant\b|i don'?t have the ability|wires crossed|this conversation is empty",
     re.I)
-MENTION = re.compile(r"@agent1[0-9a-z]+\s*", re.I)
+MENTION = re.compile(r"^(\s*@[\w.-]+\s*)+")  # leading @familyshield / @agent1... mentions
 recent_messages: dict[str, list[float]] = {}
 muted_until: dict[str, float] = {}
 last_case_at: dict[str, float] = {}
@@ -178,6 +181,10 @@ async def tell_parent(ctx: Context, case_id: str, text: str, card: list | None =
 async def finish(ctx: Context, case_id: str, state: str, text: str, when: str = ""):
     """Close the case, remember the result for "status", and send it now (with its coloured card)."""
     case = cases[case_id]
+    case["result_base"] = text
+    if case.get("scam"):
+        text += "\n\n" + case["scam"]  # information only; the result above is decided by the student
+    case["result_text"] = text
     card = result_card(RESULT_CARD[state], case["student"].title(), when or datetime.now().strftime("%I:%M %p"))
     close(case_id, state, text, card)
     await reply_now(ctx, case["parent"], text, card)
@@ -293,6 +300,8 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
     reply += STATUS_HINT
     reply_later(sender, reply)  # held a few seconds so the "calling now" update can replace it
 
+    if SCAM_INTEL:
+        await ctx.send(SCAM_INTEL, CheckScam(case_id=case_id, text=text))
     if VOICE_ANALYST:
         # An exact note id if the parent gave one, otherwise the newest note named after the child.
         note = info["note_id"] or info["student_name"].lower()
@@ -324,6 +333,22 @@ async def on_claims(ctx: Context, sender: str, msg: Claims):
     if len(lines) > 1:
         # Stored, not sent: a new message would hide the one already on screen. Shown on "status".
         cases[msg.case_id]["claims"] = "\n".join(lines)
+    if SCAM_INTEL and msg.transcript.strip():
+        # The actual voice note is a better match than the parent's summary of it.
+        await ctx.send(SCAM_INTEL, CheckScam(case_id=msg.case_id, text=msg.transcript))
+
+
+@agent.on_message(model=ScamReport)
+async def on_scam_report(ctx: Context, sender: str, msg: ScamReport):
+    case = cases.get(msg.case_id)
+    if not case or not msg.summary:
+        return
+    case["scam"] = msg.summary  # a later report (from the transcript) replaces an earlier one
+    # Arrived after the result: update the stored result so "status" shows it too.
+    parent = case["parent"]
+    if case["state"] in DONE and parent in last_result and last_result[parent][0] == case.get("result_text"):
+        case["result_text"] = case["result_base"] + "\n\n" + msg.summary
+        last_result[parent] = (case["result_text"], last_result[parent][1])
 
 
 @agent.on_message(model=Contact)

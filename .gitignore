@@ -16,3 +16,6 @@ agent_*.json
 
 # Moss local index cache
 .moss-cache/
+
+# Scraped scam reports (regenerate with: python -m services.scam_intel seed)
+data/
