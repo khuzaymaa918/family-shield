@@ -85,6 +85,26 @@ def _domain(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+# Government, consumer-protection and major news sources first; forums and social media last.
+TRUSTED = ("ftc.gov", "fbi.gov", "ic3.gov", "consumerfinance.gov", "fcc.gov", "aarp.org", "bbb.org",
+           "nytimes.com", "washingtonpost.com", "cnn.com", "nbcnews.com", "abcnews.go.com", "cbsnews.com",
+           "npr.org", "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "theguardian.com", "usatoday.com",
+           "wsj.com", "forbes.com", "nbcnewyork.com", "abc7news.com")
+LOW = ("reddit.com", "facebook.com", "instagram.com", "tiktok.com", "x.com", "twitter.com", "youtube.com",
+       "quora.com", "linkedin.com", "medium.com", "pinterest.com")
+
+
+def credibility(source: str) -> int:
+    """Higher = more credible. .gov/.mil and known outlets first, social media last."""
+    if source.endswith((".gov", ".mil")) or ".gov." in source:
+        return 3
+    if any(source == t or source.endswith("." + t) for t in TRUSTED):
+        return 2
+    if any(source == l or source.endswith("." + l) for l in LOW):
+        return 0
+    return 1
+
+
 # ---------- 2. Store them in Moss ----------
 
 def _docs(reports: list[dict]):
@@ -139,7 +159,7 @@ def warm() -> None:
         threading.Thread(target=_load, daemon=True).start()
 
 
-def find_matches(text: str, top_k: int = 6) -> list[dict]:
+def find_matches(text: str, top_k: int = 10) -> list[dict]:
     """Closest scam reports to this story: [{"title", "url", "source"}]. [] if not ready."""
     if _moss_client() is None or not _loaded.is_set() or not text.strip():
         return []
@@ -181,6 +201,7 @@ def check_story(text: str) -> dict:
         used, pattern = reports[:3], ""
     if not used:
         return empty
+    used = sorted(used, key=lambda r: -credibility(r.get("source", "")))  # stable: keeps match order within a tier
     sources = []
     for r in used:
         if r.get("source") and r["source"] not in sources:

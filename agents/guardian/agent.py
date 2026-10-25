@@ -86,6 +86,20 @@ STATUS_WORDS = re.compile(
     r"\b(status|update|result|news|any word|what happened|safe|ok|okay|did (he|she|they)|is (he|she|they))\b|\?$",
     re.I)
 STATUS_HINT = "\n\nTap \"Check result\" or type \"status\" anytime for the latest update."
+HELP_WORDS = re.compile(
+    r"\b(what (do|can|does) (you|it|family shield)|who are you|how (do|does) (you|it|this) work|"
+    r"what is (this|family shield)|help|explain)\b", re.I)
+HELP_TEXT = (
+    "I'm **Family Shield**. I protect families from AI voice-clone money scams.\n\n"
+    "Scammers can copy your child's voice from a few seconds of video and send you an urgent message "
+    "asking for money. I don't try to guess if a voice is fake. I ask your real child.\n\n"
+    "**How it works**\n"
+    "1. Tell me: \"I got a voice note from Arjun asking for money.\"\n"
+    "2. My agents transcribe the voice note, compare the story with real scam reports, and find your "
+    "child's saved, verified number.\n"
+    "3. I call your child. They enter your private family check code, then tell me if they really sent it.\n"
+    "4. Tap \"Check result\": 🟢 they sent it, 🔴 scam, don't pay, or 🟡 not confirmed yet, don't pay.\n\n"
+    "I never tell you to send money. Only your child's own answer decides.")
 
 # ASI:One only shows agent messages that arrive shortly after the parent's message, and drops later
 # ones. A phone check takes 30-60s, so the result usually arrives too late to show on its own: the
@@ -134,6 +148,16 @@ def loop_guard(sender: str, text: str, mentioned: bool) -> str:
     return ""
 
 
+REPORT_WORDS = re.compile(r"voice ?note|message|call(ed)?|text(ed)?|money|\$|scam|asking|asked|bail|emergency|"
+                          r"urgent|help|cloned?|pretend", re.I)
+
+
+def quick_name(text: str) -> str:
+    """Fast name guess without Claude, for the instant first reply: "from Arjun", "my son Arjun"..."""
+    m = re.search(r"\b(?:from|son|daughter|child|kid|named|it's|its)\s+([A-Z][a-z]+)", text)
+    return m.group(1) if m else ""
+
+
 def card_click(text: str) -> str:
     """A tapped card button arrives as JSON like {"action": "status"}: turn it into the word "status"."""
     try:
@@ -175,19 +199,70 @@ async def reply_now(ctx: Context, parent: str, text: str, card: list | None = No
 
 
 async def tell_parent(ctx: Context, case_id: str, text: str, card: list | None = None):
-    """An in-progress update: improves the queued reply instead of sending a new message."""
+    """An in-progress update. ASI:One only shows replies that come back within a couple of seconds of
+    the parent's message; later ones go to the parent's personal AI instead of the screen. So we don't
+    send updates: we store them, and the parent sees them by tapping "Check result" (or typing status)."""
     case = cases.get(case_id)
     if case:
-        reply_later(case["parent"], text, card)
+        case["progress"] = (text, card)
+
+
+def log_step(case: dict, step: str):
+    """Add a step to the case timeline (shown under status replies and the result)."""
+    case.setdefault("timeline", []).append((datetime.now().strftime("%I:%M %p").lstrip("0"), step))
+
+
+def timeline(case: dict) -> str:
+    steps = case.get("timeline", [])
+    if not steps:
+        return ""
+    return "🕒 **Case timeline**\n" + "\n".join(f"- **{t}**  {s}" for t, s in steps)
+
+
+def with_timeline(text: str, case: dict) -> str:
+    t = timeline(case)
+    return f"{text}\n\n{t}" if t else text
+
+
+def scam_line(case: dict) -> str:
+    """The Scam Intel line under a result. Under a green result a "matches a scam pattern" warning would
+    contradict it, so it becomes advice: the message looked like a scam, but the child confirmed it."""
+    summary = case.get("scam", "")
+    if not summary or case.get("state") != CONFIRMED:
+        return summary
+    m = re.search(r'"([^"]+)" pattern', summary)
+    pattern = f" ({m.group(1)})" if m else ""
+    name = case["student"].title()
+    return (f"💡 This message looked like a known scam pattern{pattern}, but {name} confirmed they sent it. "
+            f"Talk to {name} directly, and avoid paying by gift cards, crypto or wire transfer: scammers use "
+            "them because they can't be reversed.")
+
+
+def family_alert(case: dict) -> str:
+    """After a confirmed scam: a warning the parent can forward to the rest of the family.
+    Scammers who cloned one child's voice often try other relatives next."""
+    name = case["student"].title()
+    m = re.search(r'"([^"]+)" pattern', case.get("scam", ""))
+    story = f' The story used: "{m.group(1)}".' if m else ""
+    return ("🚨 **Warn your family.** Scammers who copy one person's voice often try other relatives next. "
+            "Copy this into your family group chat:\n\n"
+            f"> ⚠️ Family alert: someone is using an AI copy of {name}'s voice to ask for money. "
+            f"{name} confirmed it wasn't them.{story} If you get a call, voice note or text from \"{name}\" "
+            f"asking for money, don't pay. Hang up and call {name} on their saved number. "
+            "Never pay by gift cards, crypto or wire transfer.")
 
 
 async def finish(ctx: Context, case_id: str, state: str, text: str, when: str = ""):
     """Close the case, remember the result for "status", and send it now (with its coloured card)."""
     case = cases[case_id]
     case["result_base"] = text
+    case["state"] = state
     if case.get("scam"):
-        text += "\n\n" + case["scam"]  # information only; the result above is decided by the student
-    case["result_text"] = text
+        text += "\n\n" + scam_line(case)  # information only; the result above is decided by the student
+    if state == SCAM:
+        text += "\n\n" + family_alert(case)
+    case["result_text"] = with_timeline(text, case)
+    text = case["result_text"]
     card = result_card(RESULT_CARD[state], case["student"].title(), when or datetime.now().strftime("%I:%M %p"))
     close(case_id, state, text, card)
     await reply_now(ctx, case["parent"], text, card)
@@ -236,6 +311,11 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
         ctx.logger.info(f"Ignoring message from {sender[:16]}... ({why})")
         return
 
+    # "What do you do?" gets an explanation, even right after a case.
+    if len(text.split()) <= 12 and HELP_WORDS.search(text) and not REPORT_WORDS.search(text):
+        await reply_now(ctx, sender, HELP_TEXT)
+        return
+
     # A case is already running for this parent: give a status update.
     if sender in open_case:
         case = cases[open_case[sender]]
@@ -247,8 +327,8 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
             status += "\n\n" + case["claims"]
         if case.get("scam"):
             status += "\n\n" + case["scam"]
-        card = progress_card(case["student"].title()) if case["state"] == WAITING_FOR_STUDENT else None
-        reply_later(sender, status + STATUS_HINT, card)  # if the result lands in the next few seconds, it replaces this
+        # Instant reply (no Claude) so ASI:One shows it, with the button to check again.
+        await reply_now(ctx, sender, with_timeline(status, case) + STATUS_HINT, progress_card(case["student"].title()))
         return
 
     # The case is finished: repeat the result (ASI:One may have hidden it).
@@ -261,6 +341,19 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
         await reply_now(ctx, sender, *last_result[sender])
         return
 
+    # Reply INSTANTLY (before Claude, which takes a few seconds), so ASI:One shows this message and the
+    # "Check result" button. Slower replies are handed to the parent's personal AI instead.
+    acked = False
+    if REPORT_WORDS.search(text):
+        guess = quick_name(text)
+        who = guess.title() if guess else "your child"
+        await reply_now(ctx, sender, (
+            f"Don't send any money yet. I'm checking with {who} directly now: I'll call them on their saved "
+            "number and they'll confirm with your family check code. This takes about a minute."
+            "\n\nWhen the call is done, tap \"Check result\" (or type \"status\")."),
+            progress_card(who))
+        acked = True
+
     info = await asyncio.to_thread(read_parent_message, text)
     if sender in asked_name and not info["student_name"] and len(text.split()) <= 3:
         # They are answering our "what is your child's name?" question.
@@ -268,7 +361,7 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
         info["is_new_case"] = True
     if sender in asked_name and info["student_name"]:
         info["is_new_case"] = True
-    if not info["is_new_case"]:
+    if not info["is_new_case"] and not acked:
         await reply_now(ctx, sender, (
             "Hi, I'm Family Shield. If you got a call, voice note or text that claims to be your child "
             "and asks for money, tell me your child's name (and the voice note id if you have one). "
@@ -291,6 +384,7 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
     }
     open_case[sender] = case_id
     last_case_at[sender] = time.time()
+    log_step(cases[case_id], "Case opened: checking the message")
     ctx.logger.info(f"Case {case_id} opened for {info['student_name']}")
 
     last_result.pop(sender, None)
@@ -299,7 +393,9 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
     if cases[case_id]["warning"]:
         reply += "\n\n" + cases[case_id]["warning"]
     reply += STATUS_HINT
-    reply_later(sender, reply)  # held a few seconds so the "calling now" update can replace it
+    cases[case_id]["progress"] = (reply, progress_card(info["student_name"].title()))
+    if not acked:
+        reply_later(sender, reply, progress_card(info["student_name"].title()))
 
     if SCAM_INTEL:
         await ctx.send(SCAM_INTEL, CheckScam(case_id=case_id, text=text))
@@ -334,6 +430,7 @@ async def on_claims(ctx: Context, sender: str, msg: Claims):
     if len(lines) > 1:
         # Stored, not sent: a new message would hide the one already on screen. Shown on "status".
         cases[msg.case_id]["claims"] = "\n".join(lines)
+        log_step(cases[msg.case_id], "Voice note transcribed and analyzed")
     if SCAM_INTEL and msg.transcript.strip():
         # The actual voice note is a better match than the parent's summary of it.
         await ctx.send(SCAM_INTEL, CheckScam(case_id=msg.case_id, text=msg.transcript))
@@ -344,11 +441,13 @@ async def on_scam_report(ctx: Context, sender: str, msg: ScamReport):
     case = cases.get(msg.case_id)
     if not case or not msg.summary:
         return
+    if not case.get("scam"):
+        log_step(case, f"Checked against real scam reports ({msg.matches} match{'es' if msg.matches != 1 else ''})")
     case["scam"] = msg.summary  # a later report (from the transcript) replaces an earlier one
     # Arrived after the result: update the stored result so "status" shows it too.
     parent = case["parent"]
     if case["state"] in DONE and parent in last_result and last_result[parent][0] == case.get("result_text"):
-        case["result_text"] = case["result_base"] + "\n\n" + msg.summary
+        case["result_text"] = with_timeline(case["result_base"] + "\n\n" + scam_line(case), case)
         last_result[parent] = (case["result_text"], last_result[parent][1])
 
 
@@ -358,6 +457,7 @@ async def on_contact(ctx: Context, sender: str, msg: Contact):
     if not case or case["state"] in DONE:
         return
     if not msg.phone:
+        log_step(case, f"No saved, verified number for {msg.student_name.title()}: no call made")
         await finish(ctx, msg.case_id, NOT_CONFIRMED,
             f"🟡 NOT CONFIRMED. I don't have a verified number for {msg.student_name.title()}, "
             "so I can't check. Don't send money. Call your child on the number you already know.")
@@ -367,6 +467,7 @@ async def on_contact(ctx: Context, sender: str, msg: Contact):
         return
     case["state"] = WAITING_FOR_STUDENT
     case["started"] = time.time()
+    log_step(case, f"Found {msg.student_name.title()}'s saved, verified number")
     await ctx.send(VERIFIER, ReachStudent(case_id=msg.case_id, student_name=msg.student_name, phone=msg.phone))
 
 
@@ -376,12 +477,14 @@ async def on_reached(ctx: Context, sender: str, msg: Reached):
     if not case or case["state"] in DONE:
         return
     if msg.delivered:
+        log_step(case, f"Calling {case['student'].title()} now")
         text = (f"Don't send any money yet. I'm calling {case['student'].title()} now. They'll enter your "
                 "family check code and tell me whether they really sent that message.")
         if case.get("warning"):
             text += "\n\n" + case["warning"]
         await tell_parent(ctx, msg.case_id, text + STATUS_HINT, progress_card(case["student"].title()))
     else:
+        log_step(case, f"Couldn't place the call to {case['student'].title()}")
         await finish(ctx, msg.case_id, NOT_CONFIRMED,
             f"🟡 NOT CONFIRMED. I couldn't reach {case['student'].title()}. "
             "Don't send money. Try calling them on the number you already know.")
@@ -393,6 +496,10 @@ async def on_code_result(ctx: Context, sender: str, msg: CodeResult):
     if not case or case["state"] in DONE:
         return
     name = case["student"].title()
+    log_step(case, {"sent": f"{name} entered the check code and said YES, they sent it",
+                    "not_sent": f"{name} entered the check code and said NO, they didn't send it",
+                    "no_answer": f"{name} entered the check code but didn't answer the question"}
+             .get(msg.result, "Wrong check code entered twice"))
     # Only here can a case turn green or red: the student's own answer after their check code.
     if msg.result == "sent":
         await finish(ctx, msg.case_id, CONFIRMED,
@@ -421,6 +528,7 @@ async def check_timeouts(ctx: Context):
     now = time.time()
     for case_id, case in list(cases.items()):
         if case["state"] == WAITING_FOR_STUDENT and now - case["started"] > CODE_TIMEOUT_SECONDS:
+            log_step(case, "No check code within 3 minutes")
             await finish(ctx, case_id, NOT_CONFIRMED,
                 f"🟡 NOT CONFIRMED. {case['student'].title()} hasn't entered the check code yet. "
                 "They may just be busy. "
