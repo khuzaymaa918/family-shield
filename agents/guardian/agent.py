@@ -56,6 +56,9 @@ VERIFIER = os.getenv("VERIFIER_ADDRESS", "")
 SCAM_INTEL = os.getenv("SCAM_INTEL_ADDRESS", "")  # optional: pattern check against real scam reports
 # How long to wait for the student's code before telling the parent "not confirmed".
 CODE_TIMEOUT_SECONDS = int(os.getenv("CODE_TIMEOUT_SECONDS", "180"))
+# How long the number lookup may take before the call starts (Family agent offline, lost message...).
+# Generous on purpose: a cold Moss lookup can take ~20s, and a timed-out case never places the call.
+LOOKUP_TIMEOUT_SECONDS = 120
 
 agent = Agent(
     name="family_shield_guardian",
@@ -538,6 +541,11 @@ async def check_timeouts(ctx: Context):
                 f"🟡 NOT CONFIRMED. {case['student'].title()} hasn't entered the check code yet. "
                 "They may just be busy. "
                 "Don't send money until you reach them yourself.")
+        elif case["state"] == PENDING and now - case["started"] > LOOKUP_TIMEOUT_SECONDS:
+            log_step(case, "Couldn't start the call in time")
+            await finish(ctx, case_id, NOT_CONFIRMED,
+                f"🟡 NOT CONFIRMED. I couldn't start the check with {case['student'].title()} in time. "
+                "Don't send money. Call your child on the number you already know.")
 
 
 agent.include(chat_proto, publish_manifest=True)
