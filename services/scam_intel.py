@@ -1,6 +1,7 @@
 """Scam Intelligence: real scam reports (Apify) in a Moss index, explained by Claude. Owner: Lead (P1).
 
 1. ONCE, ahead of time:  python -m services.scam_intel seed
+     (without APIFY_TOKEN it uses the reports already saved in data/scam_reports.json)
      Apify's Google Search Scraper collects recent news / FTC / consumer-alert results about
      voice-clone and family-emergency money scams. They're saved to data/scam_reports.json and put
      in the Moss index "scam-patterns" (one document per report).
@@ -124,6 +125,9 @@ def seed(reports: list[dict] | None = None) -> int:
     client = _moss_client()
     if client is None:
         raise SystemExit("Set MOSS_PROJECT_ID and MOSS_PROJECT_KEY in .env first")
+    if reports is None and not APIFY_TOKEN and REPORTS_FILE.exists():
+        print(f"No APIFY_TOKEN: using the saved reports in {REPORTS_FILE.name}")
+        reports = json.loads(REPORTS_FILE.read_text())
     if reports is None:
         print("Collecting scam reports with Apify (can take a minute)...")
         reports = scrape_reports()

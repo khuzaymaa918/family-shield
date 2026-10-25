@@ -109,26 +109,99 @@ doesn't intercept the call.*
 - **Every call says it's an AI** calling for the family.
 - **Loop guard:** Family Shield ignores other AI assistants replying in the chat, so agents can't trigger calls by talking to each other.
 
+## Who it's for
+
+Parents of college students who live far from home, especially families of international students: a parent
+in another time zone who can't easily reach their child and feels pressure to pay fast.
+
+## Known limitations
+
+- **The result needs one tap.** ASI:One only shows agent replies that arrive within a few seconds, and the phone
+  check takes about a minute, so the parent taps **Check result** (or types `@familyshield status`). Refreshing
+  the page also shows replies that didn't appear live.
+- **Demo family only.** The family directory is seeded with one demo student (Arjun, code `2580`). Adding family
+  members from chat is future work.
+- **One phone number per student, no backup contact.** If the student doesn't answer, the result is 🟡.
+- **Quick tunnels expire.** A `trycloudflare.com` URL changes every time cloudflared restarts; update
+  `CODE_WEBHOOK_URL` and rerun `cartesia_setup` when it does (or use a named Cloudflare tunnel).
+- **iPhone call screening** can silence the verification call from an unknown number. Save the Cartesia number
+  as a contact first.
+- **English voice notes.** Cartesia supports other languages, but the demo is tuned for English.
+- **State is in memory.** Restarting the Guardian forgets open cases.
+
 ## Run it yourself
+
+### 1. What you need
+
+- Python 3.10+ (tested on 3.13) and [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/)
+- Accounts and keys: [Agentverse](https://agentverse.ai) + [ASI:One](https://asi1.ai) (Fetch.ai),
+  [Anthropic](https://console.anthropic.com), [Cartesia](https://play.cartesia.ai) (with a phone number for
+  outbound calls), [Moss](https://moss.dev), [Supabase](https://supabase.com) (optional), [Apify](https://apify.com) (optional)
+- A phone that will receive the verification call
+
+### 2. Install
 
 ```bash
 git clone https://github.com/khuzaymaa918/family-shield.git
 cd family-shield
-python3 -m venv venv && source venv/bin/activate
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env              # fill in your keys; never commit .env
+cp .env.example .env
 ```
 
-One-time setup:
+Fill in `.env` (it is git-ignored; never commit it):
+
+- `ANTHROPIC_API_KEY`, `CARTESIA_API_KEY`, `MOSS_PROJECT_ID`, `MOSS_PROJECT_KEY`
+- `DEMO_STUDENT_PHONE`: the phone that gets the call, like `+14155550123`
+- `CODE_WEBHOOK_SECRET`: any long random string, e.g. the output of `python3 -c "import secrets; print(secrets.token_hex(24))"`
+- One seed per agent (`GUARDIAN_SEED`, `VOICE_ANALYST_SEED`, `FAMILY_SEED`, `VERIFIER_SEED`, `SCAM_INTEL_SEED`):
+  any long random string each. The seed decides the agent's address, so keep them stable.
+- Optional: `SUPABASE_URL` and `SUPABASE_KEY` (voice notes), `APIFY_TOKEN` (fresh scam reports)
+
+### 3. Get the agent addresses
+
+Start each helper agent once, copy the `agent1q...` address it prints, then stop it with Ctrl+C:
 
 ```bash
-cloudflared tunnel --url http://localhost:8090   # copy the https URL into CODE_WEBHOOK_URL
-python -m services.cartesia_setup                # configures the Cartesia call agent
-python -m services.data_tools seed               # family directory in Moss
-python -m services.scam_intel seed               # scam reports: Apify → Moss
+python -m agents.voice_analyst.agent   # -> VOICE_ANALYST_ADDRESS
+python -m agents.family.agent          # -> FAMILY_ADDRESS
+python -m agents.verifier.agent        # -> VERIFIER_ADDRESS
+python -m agents.scam_intel.agent      # -> SCAM_INTEL_ADDRESS
 ```
 
-Start the agents (one terminal each, Guardian last):
+Put the four addresses in `.env`. The first time each agent starts, open the Agent inspector link it prints and
+click **Connect → Mailbox** so it is reachable through Agentverse.
+
+### 4. Seed the data (once)
+
+```bash
+python -m services.data_tools seed    # demo family in Moss (Arjun, check code 2580, your DEMO_STUDENT_PHONE)
+python -m services.scam_intel seed    # 58 real scam reports -> Moss (uses data/scam_reports.json without APIFY_TOKEN)
+```
+
+**Voice note:** put an mp3 of someone asking for money in `samples/arjun-1.mp3`, or upload it to a Supabase
+Storage bucket called `voice-notes`. Without one, Family Shield still verifies by phone and just skips the
+voice-note analysis.
+
+### 5. Set up the phone call (Cartesia)
+
+1. In the [Cartesia dashboard](https://play.cartesia.ai), create a voice agent named **`family-shield-verifier`**
+   and give it a phone number (or run `python -m services.cartesia_setup --provision-number`).
+2. Start a tunnel to the webhook and leave it running:
+   ```bash
+   cloudflared tunnel --url http://127.0.0.1:8090
+   ```
+3. Put the printed `https://....trycloudflare.com` address in `CODE_WEBHOOK_URL` (no spaces), then:
+   ```bash
+   python -m services.cartesia_setup
+   ```
+   Copy the printed `CARTESIA_AGENT_ID` and `CARTESIA_FROM_NUMBER_ID` into `.env`. Rerun this whenever the
+   tunnel URL changes.
+
+### 6. Start the agents
+
+One terminal each (`source venv/bin/activate` first), Guardian last. Or use `make verifier`, `make family`, ...
 
 ```bash
 python -m agents.verifier.agent
@@ -137,6 +210,17 @@ python -m agents.voice_analyst.agent
 python -m agents.scam_intel.agent
 python -m agents.guardian.agent
 ```
+
+Connect the Guardian's mailbox too, then message it in ASI:One by its address (or give it a handle on
+Agentverse) and follow **Try it in ASI:One** above.
+
+### Troubleshooting
+
+- **"address already in use"**: an old copy is still running. `lsof -ti tcp:8000,8001,8002,8003,8004,8090 | xargs kill -9`
+- **The call says the system isn't responding**: the tunnel is down or `CODE_WEBHOOK_URL` is stale. Restart
+  cloudflared, update `.env`, rerun `cartesia_setup`.
+- **ASI:One keeps loading**: refresh the page or send `@familyshield status`.
+- **`python: command not found`**: activate the venv first (`source venv/bin/activate`).
 
 ## Team
 
