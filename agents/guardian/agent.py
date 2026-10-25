@@ -96,38 +96,41 @@ REPLY_WAIT_SECONDS = float(os.getenv("REPLY_WAIT_SECONDS", "0"))
 pending: dict[str, dict] = {}
 
 # ---------- Loop guard ----------
-# In some ASI:One chats the user's personal AI sits in the middle and answers our replies with its own
-# long messages. Without a guard the two AIs talk forever, burn credits, and could open cases (and
-# phone calls) from AI chatter. Real parents send short messages, a few at a time.
-LOOP_WINDOW_SECONDS = 60        # look at messages from one sender in this window...
-LOOP_MAX_MESSAGES = 5           # ...more than this many = a loop: mute the sender
-MUTE_SECONDS = 300
+# In ASI:One the parent's personal AI shares the parent's address and often answers OUR replies with its
+# own essays ("Understood - holding all payments..."). If we answered those, the two AIs would talk
+# forever and could open cases (and phone calls) from AI chatter. So:
+#   - a message that starts with @familyshield / @agent1... is the parent: always handled, never muted
+#   - a message without a mention that looks like an AI reply is ignored quietly (no reply = no loop)
+#   - a flood without mentions is ignored too, but the sender is never muted
+LOOP_WINDOW_SECONDS = 60
+LOOP_MAX_MESSAGES = 4           # more unmentioned messages than this per minute = another AI looping
 NEW_CASE_COOLDOWN_SECONDS = 90  # one new case per sender per this many seconds
-MAX_PARENT_WORDS = 120          # longer than this = almost certainly an AI essay, not a worried parent
+MAX_PARENT_WORDS = 60           # unmentioned messages longer than this are almost certainly AI essays
 AI_CHATTER = re.compile(
     r"\b(i'?m|i am) (\w+, )?(an? )?(ai|assistant|shopping assistant|language model)\b|\bas an ai\b|"
-    r"\ban ai assistant\b|i don'?t have the ability|wires crossed|this conversation is empty",
+    r"\ban ai assistant\b|i don'?t have the ability|wires crossed|this conversation is empty|"
+    r"^(understood|got it|noted|quick (note|check|clarification)|thanks\s*[-—–])|"
+    r"\*\*|^\s*\d+\.\s|\n\s*\d+\.\s|\n\s*[-•]\s|"
+    r"type \W?status|check result|family check code|no money (will|moves)|holding|on hold|standing by",
     re.I)
 MENTION = re.compile(r"^(\s*@[\w.-]+\s*)+")  # leading @familyshield / @agent1... mentions
 recent_messages: dict[str, list[float]] = {}
-muted_until: dict[str, float] = {}
 last_case_at: dict[str, float] = {}
 
 
-def loop_guard(sender: str, text: str) -> str:
+def loop_guard(sender: str, text: str, mentioned: bool) -> str:
     """Returns why to ignore this message, or "" to handle it."""
+    if mentioned:
+        return ""  # the parent addressed Family Shield directly
     now = time.time()
-    if muted_until.get(sender, 0) > now:
-        return "muted"
     times = [t for t in recent_messages.get(sender, []) if now - t < LOOP_WINDOW_SECONDS] + [now]
     recent_messages[sender] = times
     if len(times) > LOOP_MAX_MESSAGES:
-        muted_until[sender] = now + MUTE_SECONDS
-        return "loop"
+        return "too many messages without @familyshield"
     if len(text.split()) > MAX_PARENT_WORDS:
         return "too long"
     if AI_CHATTER.search(text):
-        return "another AI talking"
+        return "looks like another AI replying"
     return ""
 
 
@@ -224,15 +227,13 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
 
 
 async def handle_parent_text(ctx: Context, sender: str, text: str):
-    text = card_click(MENTION.sub("", text).strip())
-    why = loop_guard(sender, text)
+    mentioned = bool(MENTION.match(text))
+    clicked = card_click(MENTION.sub("", text).strip())
+    is_click = clicked == "status" and clicked != MENTION.sub("", text).strip()
+    text = clicked
+    why = loop_guard(sender, text, mentioned or is_click)
     if why:
         ctx.logger.info(f"Ignoring message from {sender[:16]}... ({why})")
-        if why == "loop":
-            await reply_now(ctx, sender, (
-                "I'm pausing this chat for a few minutes: it looks like another AI assistant is replying "
-                "for you. Please open a direct chat with Family Shield (Agentverse -> family_shield_guardian "
-                "-> Chat with Agent) and tell me what happened in one short message."))
         return
 
     # A case is already running for this parent: give a status update.
