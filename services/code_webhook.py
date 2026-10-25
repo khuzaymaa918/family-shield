@@ -71,13 +71,18 @@ class AnswerIn(BaseModel):
     answer: str
 
 
+# Exact answers only: "no answer" or "not sure" must not count as "no", or the parent sees a false SCAM.
+YES_ANSWERS = {"1", "one", "yes", "y", "yeah", "yep"}
+NO_ANSWERS = {"2", "two", "no", "n", "nope"}
+
+
 def _yes_no(text: str) -> str:
-    """'1'/'yes' -> 'yes', '2'/'no' -> 'no', anything else -> ''."""
-    t = text.strip().lower()
+    """'1'/'yes' -> 'yes', '2'/'no' -> 'no', anything else (unclear) -> ''."""
+    t = text.strip().strip(".,!?").strip().lower()
     digits = _digits(t)
-    if digits[:1] == "1" or t.startswith("y") or t == "one":
+    if t in YES_ANSWERS or digits == "1":
         return "yes"
-    if digits[:1] == "2" or t.startswith("n") or t == "two":
+    if t in NO_ANSWERS or digits == "2":
         return "no"
     return ""
 

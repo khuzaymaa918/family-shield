@@ -1,9 +1,10 @@
 """Cartesia functions. Owner: Teammate A (P2).
 
-Plain Python only: no agents here. The lead's agents call these functions.
-Each function currently returns FAKE data so the agents can run today.
-Replace the body of each function, keep the name, inputs and output type.
-Done by 4 PM.
+Plain Python only: no agents here. The agents call these functions:
+    transcribe              voice note -> text (Cartesia speech-to-text), used by the Voice Inspector
+    deliver_voice_message   places the verification call (Cartesia agent), used by the Verifier
+    make_voice_message      the greeting as an mp3, for trying voices without placing a call
+What Cartesia does for us and its known limitations: services/CARTESIA.md.
 """
 import os
 from pathlib import Path

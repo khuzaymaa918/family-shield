@@ -56,6 +56,9 @@ VERIFIER = os.getenv("VERIFIER_ADDRESS", "")
 SCAM_INTEL = os.getenv("SCAM_INTEL_ADDRESS", "")  # optional: pattern check against real scam reports
 # How long to wait for the student's code before telling the parent "not confirmed".
 CODE_TIMEOUT_SECONDS = int(os.getenv("CODE_TIMEOUT_SECONDS", "180"))
+# How long the number lookup may take before the call starts (Family agent offline, lost message...).
+# Generous on purpose: a cold Moss lookup can take ~20s, and a timed-out case never places the call.
+LOOKUP_TIMEOUT_SECONDS = 120
 
 agent = Agent(
     name="family_shield_guardian",
@@ -89,6 +92,9 @@ STATUS_HINT = "\n\nTap \"Check result\" or type \"status\" anytime for the lates
 HELP_WORDS = re.compile(
     r"\b(what (do|can|does) (you|it|family shield)|who are you|how (do|does) (you|it|this) work|"
     r"what is (this|family shield)|help|explain)\b", re.I)
+# "help" on its own is a question about us, even though "help" in a longer message ("Arjun needs help")
+# is a report (REPORT_WORDS).
+JUST_HELP = re.compile(r"^\s*(can you |please )?help( me)?\s*[.!?]*\s*$", re.I)
 HELP_TEXT = (
     "I'm **Family Shield**. I protect families from AI voice-clone money scams.\n\n"
     "Scammers can copy your child's voice from a few seconds of video and send you an urgent message "
@@ -281,6 +287,9 @@ def close(case_id: str, state: str, text: str = "", card: list | None = None):
     case["state"] = state
     if text:
         last_result[case["parent"]] = (text, card)
+        # Restart the cooldown from the result, not from when the case opened: the call takes over a minute,
+        # so a "thanks, I'll ignore the message from Arjun" right after the result must not place a new call.
+        last_case_at[case["parent"]] = time.time()
     if open_case.get(case["parent"]) == case_id:
         del open_case[case["parent"]]
 
@@ -312,7 +321,7 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
         return
 
     # "What do you do?" gets an explanation, even right after a case.
-    if len(text.split()) <= 12 and HELP_WORDS.search(text) and not REPORT_WORDS.search(text):
+    if JUST_HELP.match(text) or (len(text.split()) <= 12 and HELP_WORDS.search(text) and not REPORT_WORDS.search(text)):
         await reply_now(ctx, sender, HELP_TEXT)
         return
 
@@ -355,7 +364,9 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
         acked = True
 
     info = await asyncio.to_thread(read_parent_message, text)
-    if sender in asked_name and not info["student_name"] and len(text.split()) <= 3:
+    # A "Check result" tap or "status" is not a name: without this, a case opened for a child called "Status".
+    if (sender in asked_name and not info["student_name"] and len(text.split()) <= 3
+            and not is_click and not STATUS_WORDS.search(text) and not HELP_WORDS.search(text)):
         # They are answering our "what is your child's name?" question.
         info["student_name"] = text.strip().split()[0].strip(".,!")
         info["is_new_case"] = True
@@ -533,6 +544,11 @@ async def check_timeouts(ctx: Context):
                 f"🟡 NOT CONFIRMED. {case['student'].title()} hasn't entered the check code yet. "
                 "They may just be busy. "
                 "Don't send money until you reach them yourself.")
+        elif case["state"] == PENDING and now - case["started"] > LOOKUP_TIMEOUT_SECONDS:
+            log_step(case, "Couldn't start the call in time")
+            await finish(ctx, case_id, NOT_CONFIRMED,
+                f"🟡 NOT CONFIRMED. I couldn't start the check with {case['student'].title()} in time. "
+                "Don't send money. Call your child on the number you already know.")
 
 
 agent.include(chat_proto, publish_manifest=True)
