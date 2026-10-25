@@ -46,6 +46,8 @@ agent = Agent(
 cases: dict[str, dict] = {}
 # After a right code, how long to wait for the 1/2 answer before reporting "no_answer".
 ANSWER_TIMEOUT_SECONDS = 45
+# The webhook gives a handler 5s (services/code_webhook.py), so the code check must answer before that.
+CODE_CHECK_SECONDS = 4
 # The startup context, so the webhook callback (which has no ctx of its own) can message the Guardian.
 _ctx: Context | None = None
 
@@ -75,7 +77,12 @@ async def on_code(case_id: str, digits: str) -> str:
         return RECORDED
     if case["code_ok"]:
         return ASK  # code already accepted: just ask the question again
-    if classify_code(case["student"], digits) == "normal":
+    # A Moss lookup can be slow: run it off the event loop, and answer before the webhook's 5s limit.
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(classify_code, case["student"], digits), CODE_CHECK_SECONDS)
+    except asyncio.TimeoutError:  # not the built-in TimeoutError before Python 3.11
+        return RETRY  # too slow to check: ask again without counting it as a wrong code
+    if result == "normal":
         case["code_ok"] = True
         asyncio.create_task(_answer_timeout(case_id))
         return ASK
