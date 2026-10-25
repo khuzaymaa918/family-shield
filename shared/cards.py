@@ -95,7 +95,6 @@ def result_card(result: str, name: str, time: str) -> list:
             "title": f"{spec['emoji']} {heading}",
             "children": [
                 {"type": "badge", "label": spec["badge"], "variant": spec["badge_variant"]},
-                {"type": "heading", "value": heading, "level": 2},
                 {"type": "text", "value": explanation, "style": "body"},
                 {"type": "text", "value": f"Checked at {time}", "style": "muted"},
             ],
