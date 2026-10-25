@@ -27,6 +27,7 @@ from services.cartesia_tools import deliver_voice_message
 from services.code_webhook import ASK, RECORDED, RETRY, start_in_background
 from services.data_tools import classify_code, warm_moss
 from shared.messages import CodeResult, Reached, ReachStudent
+from shared.trust import guardian_address, trusted
 
 load_dotenv()
 
@@ -48,6 +49,7 @@ cases: dict[str, dict] = {}
 ANSWER_TIMEOUT_SECONDS = 45
 # The webhook gives a handler 5s (services/code_webhook.py), so the code check must answer before that.
 CODE_CHECK_SECONDS = 4
+GUARDIAN = guardian_address()
 # The startup context, so the webhook callback (which has no ctx of its own) can message the Guardian.
 _ctx: Context | None = None
 
@@ -113,6 +115,10 @@ async def start_code_webhook(ctx: Context):
 
 @agent.on_message(model=ReachStudent, replies=Reached)
 async def reach_student(ctx: Context, sender: str, msg: ReachStudent):
+    # Only the Guardian may place calls; otherwise anyone could ring any number from our line.
+    if not trusted(sender, GUARDIAN):
+        ctx.logger.warning(f"Ignoring ReachStudent from {sender} (not the Guardian)")
+        return
     cases[msg.case_id] = {"student": msg.student_name, "guardian": sender, "misses": 0,
                           "code_ok": False, "reported": False}
     # Blocking HTTP, so run it off the event loop.

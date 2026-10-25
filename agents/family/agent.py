@@ -13,8 +13,10 @@ from uagents import Agent, Context
 
 from services.data_tools import get_contact, warm_moss
 from shared.messages import Contact, GetFamily
+from shared.trust import guardian_address, trusted
 
 load_dotenv()
+GUARDIAN = guardian_address()
 
 seed = os.getenv("FAMILY_SEED")
 if not seed:
@@ -35,6 +37,10 @@ async def load_directory(ctx: Context):
 
 @agent.on_message(model=GetFamily, replies=Contact)
 async def get_family(ctx: Context, sender: str, msg: GetFamily):
+    # Only the Guardian may look up a student's phone number.
+    if not trusted(sender, GUARDIAN):
+        ctx.logger.warning(f"Ignoring GetFamily from {sender} (not the Guardian)")
+        return
     contact = await asyncio.to_thread(get_contact, msg.student_name)
     await ctx.send(
         sender,

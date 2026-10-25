@@ -40,6 +40,7 @@ from uagents_core.contrib.protocols.chat import (
 
 from services.claude_tools import read_parent_message
 from shared.cards import progress_card, result_card
+from shared.trust import trusted
 from shared.messages import (
     Analyze, CheckScam, Claims, CodeResult, Contact, GetFamily, Reached, ReachStudent, ScamReport,
 )
@@ -464,6 +465,10 @@ async def on_scam_report(ctx: Context, sender: str, msg: ScamReport):
 
 @agent.on_message(model=Contact)
 async def on_contact(ctx: Context, sender: str, msg: Contact):
+    # Only our Family agent may supply the number to call.
+    if not trusted(sender, FAMILY):
+        ctx.logger.warning(f"Ignoring Contact from {sender} (not FAMILY_ADDRESS)")
+        return
     case = cases.get(msg.case_id)
     if not case or case["state"] in DONE:
         return
@@ -484,6 +489,9 @@ async def on_contact(ctx: Context, sender: str, msg: Contact):
 
 @agent.on_message(model=Reached)
 async def on_reached(ctx: Context, sender: str, msg: Reached):
+    if not trusted(sender, VERIFIER):
+        ctx.logger.warning(f"Ignoring Reached from {sender} (not VERIFIER_ADDRESS)")
+        return
     case = cases.get(msg.case_id)
     if not case or case["state"] in DONE:
         return
@@ -503,6 +511,10 @@ async def on_reached(ctx: Context, sender: str, msg: Reached):
 
 @agent.on_message(model=CodeResult)
 async def on_code_result(ctx: Context, sender: str, msg: CodeResult):
+    # Only our Verifier may report the student's answer: this is what turns a case green or red.
+    if not trusted(sender, VERIFIER):
+        ctx.logger.warning(f"Ignoring CodeResult from {sender} (not VERIFIER_ADDRESS)")
+        return
     case = cases.get(msg.case_id)
     if not case or case["state"] in DONE:
         return
