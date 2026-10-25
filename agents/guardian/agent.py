@@ -19,6 +19,7 @@ Needs in .env: GUARDIAN_SEED, VOICE_ANALYST_ADDRESS, FAMILY_ADDRESS, VERIFIER_AD
 Run from the repo root:  python -m agents.guardian.agent
 """
 import asyncio
+import json
 import os
 import re
 import time
@@ -31,12 +32,14 @@ from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
     EndSessionContent,
+    MetadataContent,
     StartSessionContent,
     TextContent,
     chat_protocol_spec,
 )
 
 from services.claude_tools import read_parent_message
+from shared.cards import progress_card, result_card
 from shared.messages import Analyze, Claims, CodeResult, Contact, GetFamily, Reached, ReachStudent
 
 load_dotenv()
@@ -75,7 +78,7 @@ asked_name: set[str] = set()
 # parent address -> final result text of their last case.
 # ASI:One only shows one agent reply per parent message, so later updates can be hidden.
 # When the parent asks again ("status"), we reply with this.
-last_result: dict[str, str] = {}
+last_result: dict[str, tuple] = {}  # (text, card)
 STATUS_WORDS = re.compile(
     r"\b(status|update|result|news|any word|what happened|safe|ok|okay|did (he|she|they)|is (he|she|they))\b|\?$",
     re.I)
@@ -85,42 +88,98 @@ STATUS_HINT = "\n\nType \"status\" anytime and I'll show you the latest update h
 # and drops anything later. So we send ONE reply per parent message: we hold it for up to
 # REPLY_WAIT_SECONDS, keep improving it as updates come in, and send it early if the case finishes.
 REPLY_WAIT_SECONDS = float(os.getenv("REPLY_WAIT_SECONDS", "25"))
-# parent address -> {"text": reply waiting to be sent, "deadline": when to send it anyway}
+# parent address -> {"text": reply waiting to be sent, "card": optional card, "deadline": when to send it anyway}
 pending: dict[str, dict] = {}
 
+# ---------- Loop guard ----------
+# In some ASI:One chats the user's personal AI sits in the middle and answers our replies with its own
+# long messages. Without a guard the two AIs talk forever, burn credits, and could open cases (and
+# phone calls) from AI chatter. Real parents send short messages, a few at a time.
+LOOP_WINDOW_SECONDS = 60        # look at messages from one sender in this window...
+LOOP_MAX_MESSAGES = 5           # ...more than this many = a loop: mute the sender
+MUTE_SECONDS = 300
+NEW_CASE_COOLDOWN_SECONDS = 90  # one new case per sender per this many seconds
+MAX_PARENT_WORDS = 120          # longer than this = almost certainly an AI essay, not a worried parent
+AI_CHATTER = re.compile(
+    r"\b(i'?m|i am) (\w+, )?(an? )?(ai|assistant|shopping assistant|language model)\b|\bas an ai\b|"
+    r"\ban ai assistant\b|i don'?t have the ability|wires crossed|this conversation is empty",
+    re.I)
+MENTION = re.compile(r"@agent1[0-9a-z]+\s*", re.I)
+recent_messages: dict[str, list[float]] = {}
+muted_until: dict[str, float] = {}
+last_case_at: dict[str, float] = {}
 
-def text_reply(text: str, end_session: bool = False) -> ChatMessage:
+
+def loop_guard(sender: str, text: str) -> str:
+    """Returns why to ignore this message, or "" to handle it."""
+    now = time.time()
+    if muted_until.get(sender, 0) > now:
+        return "muted"
+    times = [t for t in recent_messages.get(sender, []) if now - t < LOOP_WINDOW_SECONDS] + [now]
+    recent_messages[sender] = times
+    if len(times) > LOOP_MAX_MESSAGES:
+        muted_until[sender] = now + MUTE_SECONDS
+        return "loop"
+    if len(text.split()) > MAX_PARENT_WORDS:
+        return "too long"
+    if AI_CHATTER.search(text):
+        return "another AI talking"
+    return ""
+
+
+def card_click(text: str) -> str:
+    """A tapped card button arrives as JSON like {"action": "status"}: turn it into the word "status"."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    if isinstance(data, dict) and str(data.get("action", "")).lower() == "status":
+        return "status"
+    return text
+
+
+# ASI:One interactive cards (shared/cards.py): a coloured card under our text. Our text always works on its
+# own, so if cards don't render, nothing is lost. Turn them off with USE_CARDS=false in .env.
+USE_CARDS = os.getenv("USE_CARDS", "true").lower() not in ("false", "0", "no")
+RESULT_CARD = {CONFIRMED: "it_was_him", SCAM: "scam", NOT_CONFIRMED: "not_confirmed"}
+
+
+def text_reply(text: str, card: list | None = None, end_session: bool = False) -> ChatMessage:
     content = [TextContent(type="text", text=text)]
+    if card and USE_CARDS:
+        content += [block for block in card if isinstance(block, MetadataContent)]
     if end_session:
         content.append(EndSessionContent(type="end-session"))
     return ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(), content=content)
 
 
-def reply_later(parent: str, text: str):
+def reply_later(parent: str, text: str, card: list | None = None):
     """Queue (or improve) the one reply for the parent's latest message."""
     if parent in pending:
-        pending[parent]["text"] = text
+        pending[parent].update(text=text, card=card)
     else:
-        pending[parent] = {"text": text, "deadline": time.time() + REPLY_WAIT_SECONDS}
+        pending[parent] = {"text": text, "card": card, "deadline": time.time() + REPLY_WAIT_SECONDS}
 
 
-async def reply_now(ctx: Context, parent: str, text: str):
+async def reply_now(ctx: Context, parent: str, text: str, card: list | None = None):
     """Send right away and drop anything queued (it's out of date now)."""
     pending.pop(parent, None)
-    await ctx.send(parent, text_reply(text))
+    await ctx.send(parent, text_reply(text, card))
 
 
-async def tell_parent(ctx: Context, case_id: str, text: str):
+async def tell_parent(ctx: Context, case_id: str, text: str, card: list | None = None):
     """An in-progress update: improves the queued reply instead of sending a new message."""
     case = cases.get(case_id)
     if case:
-        reply_later(case["parent"], text)
+        reply_later(case["parent"], text, card)
 
 
-async def finish(ctx: Context, case_id: str, state: str, text: str):
-    """Close the case, remember the result for "status", and send it now."""
-    close(case_id, state, text)
-    await reply_now(ctx, cases[case_id]["parent"], text)
+async def finish(ctx: Context, case_id: str, state: str, text: str, when: str = ""):
+    """Close the case, remember the result for "status", and send it now (with its coloured card)."""
+    case = cases[case_id]
+    card = result_card(RESULT_CARD[state], case["student"].title(), when or datetime.now().strftime("%I:%M %p"))
+    close(case_id, state, text, card)
+    await reply_now(ctx, case["parent"], text, card)
 
 
 @agent.on_interval(period=1.0)
@@ -128,14 +187,14 @@ async def flush_replies(ctx: Context):
     now = time.time()
     for parent, item in list(pending.items()):
         if now >= item["deadline"]:
-            await reply_now(ctx, parent, item["text"])
+            await reply_now(ctx, parent, item["text"], item.get("card"))
 
 
-def close(case_id: str, state: str, text: str = ""):
+def close(case_id: str, state: str, text: str = "", card: list | None = None):
     case = cases[case_id]
     case["state"] = state
     if text:
-        last_result[case["parent"]] = text
+        last_result[case["parent"]] = (text, card)
     if open_case.get(case["parent"]) == case_id:
         del open_case[case["parent"]]
 
@@ -157,6 +216,17 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
 
 
 async def handle_parent_text(ctx: Context, sender: str, text: str):
+    text = card_click(MENTION.sub("", text).strip())
+    why = loop_guard(sender, text)
+    if why:
+        ctx.logger.info(f"Ignoring message from {sender[:16]}... ({why})")
+        if why == "loop":
+            await reply_now(ctx, sender, (
+                "I'm pausing this chat for a few minutes: it looks like another AI assistant is replying "
+                "for you. Please open a direct chat with Family Shield (Agentverse -> family_shield_guardian "
+                "-> Chat with Agent) and tell me what happened in one short message."))
+        return
+
     # A case is already running for this parent: give a status update.
     if sender in open_case:
         case = cases[open_case[sender]]
@@ -168,12 +238,18 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
             status += "\n\n" + case["claims"]
         if case.get("scam"):
             status += "\n\n" + case["scam"]
-        reply_later(sender, status + STATUS_HINT)  # if the result lands in the next few seconds, it replaces this
+        card = progress_card(case["student"].title()) if case["state"] == WAITING_FOR_STUDENT else None
+        reply_later(sender, status + STATUS_HINT, card)  # if the result lands in the next few seconds, it replaces this
         return
 
     # The case is finished: repeat the result (ASI:One may have hidden it).
     if sender in last_result and len(text.split()) <= 6 and STATUS_WORDS.search(text.strip()):
-        await reply_now(ctx, sender, last_result[sender])
+        await reply_now(ctx, sender, *last_result[sender])
+        return
+
+    # Just finished a case a moment ago: don't open another one from a follow-up.
+    if sender in last_result and time.time() - last_case_at.get(sender, 0) < NEW_CASE_COOLDOWN_SECONDS:
+        await reply_now(ctx, sender, *last_result[sender])
         return
 
     info = await asyncio.to_thread(read_parent_message, text)
@@ -205,6 +281,7 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
         "flags": info["red_flags"],
     }
     open_case[sender] = case_id
+    last_case_at[sender] = time.time()
     ctx.logger.info(f"Case {case_id} opened for {info['student_name']}")
 
     last_result.pop(sender, None)
@@ -276,7 +353,7 @@ async def on_reached(ctx: Context, sender: str, msg: Reached):
                 "family check code and tell me whether they really sent that message.")
         if case.get("warning"):
             text += "\n\n" + case["warning"]
-        await tell_parent(ctx, msg.case_id, text + STATUS_HINT)
+        await tell_parent(ctx, msg.case_id, text + STATUS_HINT, progress_card(case["student"].title()))
     else:
         await finish(ctx, msg.case_id, NOT_CONFIRMED,
             f"🟡 NOT CONFIRMED. I couldn't reach {case['student'].title()}. "
@@ -294,20 +371,20 @@ async def on_code_result(ctx: Context, sender: str, msg: CodeResult):
         await finish(ctx, msg.case_id, CONFIRMED,
             f"🟢 REQUEST CONFIRMED. {name} entered your family check code and confirmed at {msg.time} that "
             f"they DID send that message. The request really came from {name}. "
-            f"Talk to {name} directly about it before you send anything.")
+            f"Talk to {name} directly about it before you send anything.", when=msg.time)
     elif msg.result == "not_sent":
         await finish(ctx, msg.case_id, SCAM,
             f"🔴 SCAM. {name} entered your family check code and confirmed at {msg.time} that they did NOT "
             f"send that message. Someone is pretending to be {name}, possibly with a cloned voice. "
-            "Do not send any money and do not reply to whoever contacted you.")
+            "Do not send any money and do not reply to whoever contacted you.", when=msg.time)
     elif msg.result == "no_answer":
         await finish(ctx, msg.case_id, NOT_CONFIRMED,
             f"🟡 NOT CONFIRMED. {name} entered your family check code but didn't say whether they sent "
-            f"that message. Don't send money until you talk to {name} directly.")
+            f"that message. Don't send money until you talk to {name} directly.", when=msg.time)
     else:
         await finish(ctx, msg.case_id, NOT_CONFIRMED,
             f"🟡 NOT CONFIRMED. The check code entered at {msg.time} was wrong. "
-            "Don't send money. Call your child on the number you already know.")
+            "Don't send money. Call your child on the number you already know.", when=msg.time)
 
 
 # ---------- Timeout: no code in time -> amber ----------
