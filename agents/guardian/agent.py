@@ -89,6 +89,9 @@ STATUS_HINT = "\n\nTap \"Check result\" or type \"status\" anytime for the lates
 HELP_WORDS = re.compile(
     r"\b(what (do|can|does) (you|it|family shield)|who are you|how (do|does) (you|it|this) work|"
     r"what is (this|family shield)|help|explain)\b", re.I)
+# "help" on its own is a question about us, even though "help" in a longer message ("Arjun needs help")
+# is a report (REPORT_WORDS).
+JUST_HELP = re.compile(r"^\s*(can you |please )?help( me)?\s*[.!?]*\s*$", re.I)
 HELP_TEXT = (
     "I'm **Family Shield**. I protect families from AI voice-clone money scams.\n\n"
     "Scammers can copy your child's voice from a few seconds of video and send you an urgent message "
@@ -312,7 +315,7 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
         return
 
     # "What do you do?" gets an explanation, even right after a case.
-    if len(text.split()) <= 12 and HELP_WORDS.search(text) and not REPORT_WORDS.search(text):
+    if JUST_HELP.match(text) or (len(text.split()) <= 12 and HELP_WORDS.search(text) and not REPORT_WORDS.search(text)):
         await reply_now(ctx, sender, HELP_TEXT)
         return
 
