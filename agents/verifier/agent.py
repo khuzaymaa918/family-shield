@@ -22,7 +22,7 @@ from uagents import Agent, Context
 
 from services.cartesia_tools import deliver_voice_message
 from services.code_webhook import RECORDED, RETRY, start_in_background
-from services.data_tools import classify_code
+from services.data_tools import classify_code, warm_moss
 from shared.messages import CodeResult, Reached, ReachStudent
 
 load_dotenv()
@@ -79,6 +79,7 @@ async def start_code_webhook(ctx: Context):
     global _ctx
     _ctx = ctx
     start_in_background(on_code)
+    warm_moss()  # load the Moss family directory in the background
     ctx.logger.info("Code webhook started on port 8090")
 
 

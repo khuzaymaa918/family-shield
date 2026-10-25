@@ -13,3 +13,6 @@ agent_*.json
 
 # OS
 .DS_Store
+
+# Moss local index cache
+.moss-cache/
