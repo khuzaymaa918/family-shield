@@ -71,8 +71,17 @@ asked_name: set[str] = set()
 # ASI:One only shows one agent reply per parent message, so later updates can be hidden.
 # When the parent asks again ("status"), we reply with this.
 last_result: dict[str, str] = {}
-STATUS_WORDS = re.compile(r"\b(status|update|result|news|any word|did (he|she|they)|is (he|she|they))\b|\?$", re.I)
-STATUS_HINT = "\n\nType \"status\" anytime for the latest update."
+STATUS_WORDS = re.compile(
+    r"\b(status|update|result|news|any word|what happened|safe|ok|okay|did (he|she|they)|is (he|she|they))\b|\?$",
+    re.I)
+STATUS_HINT = "\n\nType \"status\" anytime and I'll show you the latest update here."
+
+# ASI:One shows only the LAST agent message that arrives shortly after the parent's message,
+# and drops anything later. So we send ONE reply per parent message: we hold it for up to
+# REPLY_WAIT_SECONDS, keep improving it as updates come in, and send it early if the case finishes.
+REPLY_WAIT_SECONDS = float(os.getenv("REPLY_WAIT_SECONDS", "25"))
+# parent address -> {"text": reply waiting to be sent, "deadline": when to send it anyway}
+pending: dict[str, dict] = {}
 
 
 def text_reply(text: str, end_session: bool = False) -> ChatMessage:
@@ -82,16 +91,39 @@ def text_reply(text: str, end_session: bool = False) -> ChatMessage:
     return ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(), content=content)
 
 
-async def tell_parent(ctx: Context, case_id: str, text: str, end_session: bool = False):
+def reply_later(parent: str, text: str):
+    """Queue (or improve) the one reply for the parent's latest message."""
+    if parent in pending:
+        pending[parent]["text"] = text
+    else:
+        pending[parent] = {"text": text, "deadline": time.time() + REPLY_WAIT_SECONDS}
+
+
+async def reply_now(ctx: Context, parent: str, text: str):
+    """Send right away and drop anything queued (it's out of date now)."""
+    pending.pop(parent, None)
+    await ctx.send(parent, text_reply(text))
+
+
+async def tell_parent(ctx: Context, case_id: str, text: str):
+    """An in-progress update: improves the queued reply instead of sending a new message."""
     case = cases.get(case_id)
     if case:
-        await ctx.send(case["parent"], text_reply(text, end_session))
+        reply_later(case["parent"], text)
 
 
 async def finish(ctx: Context, case_id: str, state: str, text: str):
-    """Close the case, remember the result for "status", and tell the parent."""
+    """Close the case, remember the result for "status", and send it now."""
     close(case_id, state, text)
-    await tell_parent(ctx, case_id, text)
+    await reply_now(ctx, cases[case_id]["parent"], text)
+
+
+@agent.on_interval(period=1.0)
+async def flush_replies(ctx: Context):
+    now = time.time()
+    for parent, item in list(pending.items()):
+        if now >= item["deadline"]:
+            await reply_now(ctx, parent, item["text"])
 
 
 def close(case_id: str, state: str, text: str = ""):
@@ -129,12 +161,14 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
                   "check code. Please don't send any money yet.")
         if case.get("claims"):
             status += "\n\n" + case["claims"]
-        await ctx.send(sender, text_reply(status + STATUS_HINT))
+        if case.get("scam"):
+            status += "\n\n" + case["scam"]
+        reply_later(sender, status + STATUS_HINT)  # if the result lands in the next few seconds, it replaces this
         return
 
     # The case is finished: repeat the result (ASI:One may have hidden it).
     if sender in last_result and len(text.split()) <= 6 and STATUS_WORDS.search(text.strip()):
-        await ctx.send(sender, text_reply(last_result[sender]))
+        await reply_now(ctx, sender, last_result[sender])
         return
 
     info = await asyncio.to_thread(read_parent_message, text)
@@ -145,14 +179,14 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
     if sender in asked_name and info["student_name"]:
         info["is_new_case"] = True
     if not info["is_new_case"]:
-        await ctx.send(sender, text_reply(
+        await reply_now(ctx, sender, (
             "Hi, I'm Family Shield. If you got a call, voice note or text that claims to be your child "
             "and asks for money, tell me your child's name (and the voice note id if you have one). "
             "I'll check with them directly before you do anything."))
         return
     if not info["student_name"]:
         asked_name.add(sender)
-        await ctx.send(sender, text_reply(
+        await reply_now(ctx, sender, (
             "Don't send any money yet. What is your child's first name? I'll check with them directly."))
         return
 
@@ -174,7 +208,7 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
     if cases[case_id]["warning"]:
         reply += "\n\n" + cases[case_id]["warning"]
     reply += STATUS_HINT
-    await ctx.send(sender, text_reply(reply))
+    reply_later(sender, reply)  # held a few seconds so the "calling now" update can replace it
 
     if info["note_id"] and VOICE_ANALYST:
         await ctx.send(VOICE_ANALYST, Analyze(case_id=case_id, note_id=info["note_id"]))
