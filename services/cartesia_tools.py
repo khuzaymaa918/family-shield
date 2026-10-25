@@ -13,9 +13,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
-# Any voice from https://play.cartesia.ai/voices. The default (Skylar) is the example voice in Cartesia's docs.
+# Any voice from https://play.cartesia.ai/voices. The default (Whitney) is calm and even, for a worried student.
 # "or" so a blank CARTESIA_VOICE_ID= line in .env still falls back to the default.
-CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID") or "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
+CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID") or "f3c7d5d2-c1e1-41a0-bd88-8b5512be5335"
 
 CARTESIA_API = "https://api.cartesia.ai"
 CARTESIA_VERSION = "2026-08-14"
@@ -24,8 +24,8 @@ SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 # The student answers the call and types the check code on the keypad; nobody nearby hears the digits.
 OUTREACH_SCRIPT = (
     "Hi, this is Family Shield, an AI assistant calling for your family. "
-    "Someone sent them a message claiming to be you. "
-    "Please enter your check code on your phone's keypad now."
+    "They just got a message that says it's from you, and they want to make sure you're okay. "
+    "Please enter your four-digit check code on your phone's keypad now."
 )
 
 
