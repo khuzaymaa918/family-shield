@@ -2,11 +2,16 @@
 
 Talks to the parent in ASI:One (Chat Protocol) and coordinates the other agents:
   parent message -> Claude reads it -> Analyze (Voice Analyst) + GetFamily (Family)
-  Contact -> ReachStudent (Verifier) -> the student gets a call and types a code
-  CodeResult -> green / amber / danger reply to the parent
+  Contact -> ReachStudent (Verifier) -> the student gets a call, types their check code,
+             then answers "Did you send that message?" (1 yes / 2 no)
+  CodeResult -> one reply to the parent:
+     🟢 REQUEST CONFIRMED  the student entered their code and said they DID send it
+     🔴 SCAM               the student entered their code and said they did NOT send it
+     🟡 NOT CONFIRMED      wrong code, no answer, no saved number, or no reply in time
 
-HARD RULE: only CodeResult(result="normal") may set CONFIRMED. Nothing else
-(Claude, the transcript, the parent, a timeout) can ever say "it's really them".
+HARD RULE: only the student's own answer, given AFTER their check code, can turn a case green or red.
+Nothing else (Claude, the transcript, how real the voice sounds, the parent, a timeout) ever decides it.
+We never tell the parent to send money, only whether the request really came from their child.
 
 Needs in .env: GUARDIAN_SEED, VOICE_ANALYST_ADDRESS, FAMILY_ADDRESS, VERIFIER_ADDRESS
 (each agent prints its address when it starts). ANTHROPIC_API_KEY is optional.
@@ -58,8 +63,8 @@ chat_proto = Protocol(spec=chat_protocol_spec)
 PENDING, WAITING_FOR_STUDENT, CONFIRMED, NOT_CONFIRMED = (
     "PENDING", "WAITING_FOR_STUDENT", "CONFIRMED", "NOT_CONFIRMED"
 )
-DANGER = "DANGER"
-DONE = (CONFIRMED, NOT_CONFIRMED, DANGER)
+SCAM = "SCAM"
+DONE = (CONFIRMED, NOT_CONFIRMED, SCAM)
 
 # case_id -> {"parent", "student", "state", "started", "flags"}
 cases: dict[str, dict] = {}
@@ -158,7 +163,7 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
         status = (f"Still checking with {case['student'].title()}. Please don't send any money yet."
                   if case["state"] == PENDING else
                   f"I've called {case['student'].title()} and I'm waiting for them to enter your family "
-                  "check code. Please don't send any money yet.")
+                  "check code and tell me whether they sent that message. Please don't send any money yet.")
         if case.get("claims"):
             status += "\n\n" + case["claims"]
         if case.get("scam"):
@@ -210,8 +215,10 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
     reply += STATUS_HINT
     reply_later(sender, reply)  # held a few seconds so the "calling now" update can replace it
 
-    if info["note_id"] and VOICE_ANALYST:
-        await ctx.send(VOICE_ANALYST, Analyze(case_id=case_id, note_id=info["note_id"]))
+    if VOICE_ANALYST:
+        # An exact note id if the parent gave one, otherwise the newest note named after the child.
+        note = info["note_id"] or info["student_name"].lower()
+        await ctx.send(VOICE_ANALYST, Analyze(case_id=case_id, note_id=note))
     if not FAMILY:
         await tell_parent(ctx, case_id, "Setup problem: FAMILY_ADDRESS is not set, so I can't look up your child.")
         return
@@ -265,8 +272,8 @@ async def on_reached(ctx: Context, sender: str, msg: Reached):
     if not case or case["state"] in DONE:
         return
     if msg.delivered:
-        text = (f"Don't send any money yet. I'm calling {case['student'].title()} now and asking for "
-                "your family check code.")
+        text = (f"Don't send any money yet. I'm calling {case['student'].title()} now. They'll enter your "
+                "family check code and tell me whether they really sent that message.")
         if case.get("warning"):
             text += "\n\n" + case["warning"]
         await tell_parent(ctx, msg.case_id, text + STATUS_HINT)
@@ -282,19 +289,24 @@ async def on_code_result(ctx: Context, sender: str, msg: CodeResult):
     if not case or case["state"] in DONE:
         return
     name = case["student"].title()
-    if msg.result == "normal":
-        # The ONLY place that may set CONFIRMED.
+    # Only here can a case turn green or red: the student's own answer after their check code.
+    if msg.result == "sent":
         await finish(ctx, msg.case_id, CONFIRMED,
-            f"🟢 CONFIRMED. {name} entered your family check code at {msg.time}. "
-            f"{name} is safe and did not send that message. Do not send money to whoever contacted you.")
-    elif msg.result == "danger":
-        await finish(ctx, msg.case_id, DANGER,
-            f"🔴 DANGER SIGNAL. {name} entered the danger code at {msg.time}. "
-            "They may be with someone and unable to talk freely. Do not send money. "
-            "Call 911 now and tell them your child may be in danger.")
+            f"🟢 REQUEST CONFIRMED. {name} entered your family check code and confirmed at {msg.time} that "
+            f"they DID send that message. The request really came from {name}. "
+            f"Talk to {name} directly about it before you send anything.")
+    elif msg.result == "not_sent":
+        await finish(ctx, msg.case_id, SCAM,
+            f"🔴 SCAM. {name} entered your family check code and confirmed at {msg.time} that they did NOT "
+            f"send that message. Someone is pretending to be {name}, possibly with a cloned voice. "
+            "Do not send any money and do not reply to whoever contacted you.")
+    elif msg.result == "no_answer":
+        await finish(ctx, msg.case_id, NOT_CONFIRMED,
+            f"🟡 NOT CONFIRMED. {name} entered your family check code but didn't say whether they sent "
+            f"that message. Don't send money until you talk to {name} directly.")
     else:
         await finish(ctx, msg.case_id, NOT_CONFIRMED,
-            f"🟡 NOT CONFIRMED. The code entered at {msg.time} was wrong. "
+            f"🟡 NOT CONFIRMED. The check code entered at {msg.time} was wrong. "
             "Don't send money. Call your child on the number you already know.")
 
 
@@ -307,7 +319,7 @@ async def check_timeouts(ctx: Context):
         if case["state"] == WAITING_FOR_STUDENT and now - case["started"] > CODE_TIMEOUT_SECONDS:
             await finish(ctx, case_id, NOT_CONFIRMED,
                 f"🟡 NOT CONFIRMED. {case['student'].title()} hasn't entered the check code yet. "
-                "That doesn't mean they're in danger, they may just be busy. "
+                "They may just be busy. "
                 "Don't send money until you reach them yourself.")
 
 

@@ -44,9 +44,9 @@ def _ask_json(system: str, user: str) -> dict:
 
 
 INTAKE_SYSTEM = """You help a parent who got a suspicious message that claims to be from their child
-(a possible AI voice-clone or virtual-kidnapping scam). Read the parent's chat message and pull out:
+(a possible AI voice-clone money scam). Read the parent's chat message and pull out:
 - "student_name": the child's first name, or "" if not given
-- "note_id": the voice note id if the parent pasted one (like "note-1"), or ""
+- "note_id": the voice note id if the parent pasted one (like "arjun-1" or "note-1"), or ""
 - "amount": money demanded, or ""
 - "red_flags": a list of up to 3 short scam warning signs you see (urgency, secrecy, gift cards, crypto, wire, "don't tell anyone", new number)
 - "is_new_case": true if the parent is reporting a suspicious message, false if it's small talk or a question"""
@@ -55,14 +55,14 @@ INTAKE_SYSTEM = """You help a parent who got a suspicious message that claims to
 def read_parent_message(text: str) -> dict:
     """Turn the parent's chat text into case details."""
     data = _ask_json(INTAKE_SYSTEM, text)
-    note = re.search(r"\bnote[-_ ]?\d+\b", text, re.I)
+    note = re.search(r"\b[a-z]+-\d+\b", text, re.I)  # "arjun-1", "note-1"
     name = (data.get("student_name") or "").strip()
     if not name:  # fallback without Claude: "from Arjun", "my son Arjun", ...
         m = re.search(r"\b(?:from|son|daughter|child|kid|named|it's|its)\s+([A-Z][a-z]+)", text)
         name = m.group(1) if m else ""
     return {
         "student_name": name,
-        "note_id": (data.get("note_id") or (note.group(0).replace(" ", "-") if note else "")).strip(),
+        "note_id": (data.get("note_id") or (note.group(0) if note else "")).strip().lower(),
         "amount": str(data.get("amount") or "").strip(),
         "red_flags": [str(f) for f in (data.get("red_flags") or [])][:3],
         "is_new_case": bool(data.get("is_new_case", True)),
