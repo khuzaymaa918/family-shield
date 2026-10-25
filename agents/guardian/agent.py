@@ -82,12 +82,13 @@ last_result: dict[str, tuple] = {}  # (text, card)
 STATUS_WORDS = re.compile(
     r"\b(status|update|result|news|any word|what happened|safe|ok|okay|did (he|she|they)|is (he|she|they))\b|\?$",
     re.I)
-STATUS_HINT = "\n\nType \"status\" anytime and I'll show you the latest update here."
+STATUS_HINT = "\n\nTap \"Check result\" or type \"status\" anytime for the latest update."
 
-# ASI:One shows only the LAST agent message that arrives shortly after the parent's message,
-# and drops anything later. So we send ONE reply per parent message: we hold it for up to
-# REPLY_WAIT_SECONDS, keep improving it as updates come in, and send it early if the case finishes.
-REPLY_WAIT_SECONDS = float(os.getenv("REPLY_WAIT_SECONDS", "25"))
+# ASI:One only shows agent messages that arrive shortly after the parent's message, and drops later
+# ones. A phone check takes 30-60s, so the result usually arrives too late to show on its own: the
+# parent taps "Check result" (or types "status") and gets it as a fresh reply. REPLY_WAIT_SECONDS can
+# hold the first reply briefly so a quick update replaces it; live testing showed 0 works best.
+REPLY_WAIT_SECONDS = float(os.getenv("REPLY_WAIT_SECONDS", "0"))
 # parent address -> {"text": reply waiting to be sent, "card": optional card, "deadline": when to send it anyway}
 pending: dict[str, dict] = {}
 
