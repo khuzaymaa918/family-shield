@@ -358,7 +358,9 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
         acked = True
 
     info = await asyncio.to_thread(read_parent_message, text)
-    if sender in asked_name and not info["student_name"] and len(text.split()) <= 3:
+    # A "Check result" tap or "status" is not a name: without this, a case opened for a child called "Status".
+    if (sender in asked_name and not info["student_name"] and len(text.split()) <= 3
+            and not is_click and not STATUS_WORDS.search(text) and not HELP_WORDS.search(text)):
         # They are answering our "what is your child's name?" question.
         info["student_name"] = text.strip().split()[0].strip(".,!")
         info["is_new_case"] = True
