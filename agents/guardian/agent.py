@@ -15,6 +15,7 @@ Run from the repo root:  python -m agents.guardian.agent
 """
 import asyncio
 import os
+import re
 import time
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -66,6 +67,12 @@ cases: dict[str, dict] = {}
 open_case: dict[str, str] = {}
 # parents we just asked "what is your child's name?"
 asked_name: set[str] = set()
+# parent address -> final result text of their last case.
+# ASI:One only shows one agent reply per parent message, so later updates can be hidden.
+# When the parent asks again ("status"), we reply with this.
+last_result: dict[str, str] = {}
+STATUS_WORDS = re.compile(r"\b(status|update|result|news|any word|did (he|she|they)|is (he|she|they))\b|\?$", re.I)
+STATUS_HINT = "\n\nType \"status\" anytime for the latest update."
 
 
 def text_reply(text: str, end_session: bool = False) -> ChatMessage:
@@ -81,9 +88,17 @@ async def tell_parent(ctx: Context, case_id: str, text: str, end_session: bool =
         await ctx.send(case["parent"], text_reply(text, end_session))
 
 
-def close(case_id: str, state: str):
+async def finish(ctx: Context, case_id: str, state: str, text: str):
+    """Close the case, remember the result for "status", and tell the parent."""
+    close(case_id, state, text)
+    await tell_parent(ctx, case_id, text)
+
+
+def close(case_id: str, state: str, text: str = ""):
     case = cases[case_id]
     case["state"] = state
+    if text:
+        last_result[case["parent"]] = text
     if open_case.get(case["parent"]) == case_id:
         del open_case[case["parent"]]
 
@@ -108,9 +123,18 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
     # A case is already running for this parent: give a status update.
     if sender in open_case:
         case = cases[open_case[sender]]
-        await ctx.send(sender, text_reply(
-            f"Still checking with {case['student'].title()}. Please don't send any money yet. "
-            "I'll message you the moment I hear back."))
+        status = (f"Still checking with {case['student'].title()}. Please don't send any money yet."
+                  if case["state"] == PENDING else
+                  f"I've called {case['student'].title()} and I'm waiting for them to enter your family "
+                  "check code. Please don't send any money yet.")
+        if case.get("claims"):
+            status += "\n\n" + case["claims"]
+        await ctx.send(sender, text_reply(status + STATUS_HINT))
+        return
+
+    # The case is finished: repeat the result (ASI:One may have hidden it).
+    if sender in last_result and len(text.split()) <= 6 and STATUS_WORDS.search(text.strip()):
+        await ctx.send(sender, text_reply(last_result[sender]))
         return
 
     info = await asyncio.to_thread(read_parent_message, text)
@@ -144,9 +168,12 @@ async def handle_parent_text(ctx: Context, sender: str, text: str):
     open_case[sender] = case_id
     ctx.logger.info(f"Case {case_id} opened for {info['student_name']}")
 
+    last_result.pop(sender, None)
+    cases[case_id]["warning"] = ("Warning signs I see: " + "; ".join(info["red_flags"]) + ".") if info["red_flags"] else ""
     reply = f"Don't send any money yet. I'm checking with {info['student_name'].title()} directly now."
-    if info["red_flags"]:
-        reply += "\n\nWarning signs I see: " + "; ".join(info["red_flags"]) + "."
+    if cases[case_id]["warning"]:
+        reply += "\n\n" + cases[case_id]["warning"]
+    reply += STATUS_HINT
     await ctx.send(sender, text_reply(reply))
 
     if info["note_id"] and VOICE_ANALYST:
@@ -176,7 +203,8 @@ async def on_claims(ctx: Context, sender: str, msg: Claims):
     if msg.story != "unknown":
         lines.append(f"- Story: {msg.story}")
     if len(lines) > 1:
-        await tell_parent(ctx, msg.case_id, "\n".join(lines))
+        # Stored, not sent: a new message would hide the one already on screen. Shown on "status".
+        cases[msg.case_id]["claims"] = "\n".join(lines)
 
 
 @agent.on_message(model=Contact)
@@ -185,8 +213,7 @@ async def on_contact(ctx: Context, sender: str, msg: Contact):
     if not case or case["state"] in DONE:
         return
     if not msg.phone:
-        close(msg.case_id, NOT_CONFIRMED)
-        await tell_parent(ctx, msg.case_id,
+        await finish(ctx, msg.case_id, NOT_CONFIRMED,
             f"🟡 NOT CONFIRMED. I don't have a verified number for {msg.student_name.title()}, "
             "so I can't check. Don't send money. Call your child on the number you already know.")
         return
@@ -204,11 +231,13 @@ async def on_reached(ctx: Context, sender: str, msg: Reached):
     if not case or case["state"] in DONE:
         return
     if msg.delivered:
-        await tell_parent(ctx, msg.case_id,
-            f"I'm calling {case['student'].title()} now and asking for your family check code.")
+        text = (f"Don't send any money yet. I'm calling {case['student'].title()} now and asking for "
+                "your family check code.")
+        if case.get("warning"):
+            text += "\n\n" + case["warning"]
+        await tell_parent(ctx, msg.case_id, text + STATUS_HINT)
     else:
-        close(msg.case_id, NOT_CONFIRMED)
-        await tell_parent(ctx, msg.case_id,
+        await finish(ctx, msg.case_id, NOT_CONFIRMED,
             f"🟡 NOT CONFIRMED. I couldn't reach {case['student'].title()}. "
             "Don't send money. Try calling them on the number you already know.")
 
@@ -221,24 +250,18 @@ async def on_code_result(ctx: Context, sender: str, msg: CodeResult):
     name = case["student"].title()
     if msg.result == "normal":
         # The ONLY place that may set CONFIRMED.
-        close(msg.case_id, CONFIRMED)
-        await tell_parent(ctx, msg.case_id,
+        await finish(ctx, msg.case_id, CONFIRMED,
             f"🟢 CONFIRMED. {name} entered your family check code at {msg.time}. "
-            f"{name} is safe and did not send that message. Do not send money to whoever contacted you.",
-            end_session=True)
+            f"{name} is safe and did not send that message. Do not send money to whoever contacted you.")
     elif msg.result == "danger":
-        close(msg.case_id, DANGER)
-        await tell_parent(ctx, msg.case_id,
+        await finish(ctx, msg.case_id, DANGER,
             f"🔴 DANGER SIGNAL. {name} entered the danger code at {msg.time}. "
             "They may be with someone and unable to talk freely. Do not send money. "
-            "Call 911 now and tell them your child may be in danger.",
-            end_session=True)
+            "Call 911 now and tell them your child may be in danger.")
     else:
-        close(msg.case_id, NOT_CONFIRMED)
-        await tell_parent(ctx, msg.case_id,
+        await finish(ctx, msg.case_id, NOT_CONFIRMED,
             f"🟡 NOT CONFIRMED. The code entered at {msg.time} was wrong. "
-            "Don't send money. Call your child on the number you already know.",
-            end_session=True)
+            "Don't send money. Call your child on the number you already know.")
 
 
 # ---------- Timeout: no code in time -> amber ----------
@@ -248,12 +271,10 @@ async def check_timeouts(ctx: Context):
     now = time.time()
     for case_id, case in list(cases.items()):
         if case["state"] == WAITING_FOR_STUDENT and now - case["started"] > CODE_TIMEOUT_SECONDS:
-            close(case_id, NOT_CONFIRMED)
-            await tell_parent(ctx, case_id,
+            await finish(ctx, case_id, NOT_CONFIRMED,
                 f"🟡 NOT CONFIRMED. {case['student'].title()} hasn't entered the check code yet. "
                 "That doesn't mean they're in danger, they may just be busy. "
-                "Don't send money until you reach them yourself.",
-                end_session=True)
+                "Don't send money until you reach them yourself.")
 
 
 agent.include(chat_proto, publish_manifest=True)
